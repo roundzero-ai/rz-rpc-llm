@@ -80,21 +80,34 @@ resolve_model_file() {
 }
 
 # ------------------------------------------------------------------------------
-# SSH helpers
+# SSH helpers — ControlMaster so password is entered only once per session
 # ------------------------------------------------------------------------------
-DGX_SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+DGX_SSH_OPTS=(
+    -o StrictHostKeyChecking=accept-new
+    -o ConnectTimeout=10
+    -o ControlMaster=auto
+    -o "ControlPath=${PID_DIR}/ssh-dgx.ctl"
+    -o ControlPersist=600
+)
 
 ssh_dgx() {
     ssh "${DGX_SSH_OPTS[@]}" "${DGX_USER}@${DGX_HOST}" "$@"
 }
 
-# Test SSH connectivity to DGX
+# Establish SSH master connection — password is prompted here and only here.
+# All subsequent ssh_dgx and rsync calls reuse the socket transparently.
 check_dgx_ssh() {
-    log "Testing SSH connection to DGX (${DGX_USER}@${DGX_HOST})..."
-    if ! ssh_dgx "echo OK" &>/dev/null; then
-        die "Cannot SSH to DGX at ${DGX_USER}@${DGX_HOST}. Check host, user, and SSH keys."
+    mkdir -p "${PID_DIR}"
+    if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+            "${DGX_USER}@${DGX_HOST}" &>/dev/null; then
+        log_ok "DGX SSH master already active (${DGX_USER}@${DGX_HOST})"
+        return 0
     fi
-    log_ok "DGX SSH connection OK"
+    log "Connecting to DGX (${DGX_USER}@${DGX_HOST}) — enter password once if prompted..."
+    if ! ssh_dgx "echo OK" ; then
+        die "Cannot SSH to DGX at ${DGX_USER}@${DGX_HOST}. Check host, user, and password/keys."
+    fi
+    log_ok "DGX SSH connection established — all subsequent commands reuse this session"
 }
 
 # ------------------------------------------------------------------------------
@@ -152,7 +165,12 @@ cmd_build_dgx() {
 
     log "Syncing source to ${DGX_USER}@${DGX_HOST}:${DGX_REMOTE_DIR} ..."
     ssh_dgx "mkdir -p '${DGX_REMOTE_DIR}'"
+    # Pass the same ControlPath so rsync reuses the master socket (no extra password prompt)
     rsync -az --progress \
+        -e "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+               -o ControlMaster=auto \
+               -o ControlPath=${PID_DIR}/ssh-dgx.ctl \
+               -o ControlPersist=600" \
         --exclude='.git' \
         --exclude='build/' \
         --exclude='*.o' \
@@ -161,9 +179,13 @@ cmd_build_dgx() {
     log_ok "Sync complete"
 
     log "Building on DGX (CUDA, SM121, $(ssh_dgx nproc) cores)..."
+    # Prepend DGX_CUDA_BIN so nvcc is found in the non-interactive SSH session
+    # (SSH does not source .bashrc/.profile, so CUDA is not in PATH by default)
     ssh_dgx "
+        export PATH='${DGX_CUDA_BIN}:\$PATH'
         set -euo pipefail
         cd '${DGX_REMOTE_DIR}'
+        echo '[DGX] nvcc:' \$(which nvcc 2>/dev/null || echo 'NOT FOUND — check DGX_CUDA_BIN in config.env')
         echo '[DGX] cmake configure...'
         cmake -B build \
             -DGGML_CUDA=ON \
@@ -173,9 +195,8 @@ cmd_build_dgx() {
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_RPC=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLAMA_FLASH_ATTENTION=ON
-        echo '[DGX] cmake build...'
-        cmake --build build --config Release -j\$(nproc)
+            -DLLAMA_FLASH_ATTENTION=ON \
+            && cmake --build build --config Release -j\$(nproc)
         echo '[DGX] Binaries:' \$(ls build/bin/)
     "
     log_ok "DGX build complete"
