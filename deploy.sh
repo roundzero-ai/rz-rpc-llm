@@ -181,8 +181,10 @@ cmd_build_dgx() {
     log "Building on DGX (CUDA, SM121, $(ssh_dgx nproc) cores)..."
     # Prepend DGX_CUDA_BIN so nvcc is found in the non-interactive SSH session
     # (SSH does not source .bashrc/.profile, so CUDA is not in PATH by default)
+    local cuda_bin="${DGX_CUDA_BIN:-/usr/local/cuda/bin}"
+    log "CUDA bin : ${cuda_bin}"
     ssh_dgx "
-        export PATH='${DGX_CUDA_BIN}:\$PATH'
+        export PATH='${cuda_bin}:\$PATH'
         set -euo pipefail
         cd '${DGX_REMOTE_DIR}'
         echo '[DGX] nvcc:' \$(which nvcc 2>/dev/null || echo 'NOT FOUND — check DGX_CUDA_BIN in config.env')
