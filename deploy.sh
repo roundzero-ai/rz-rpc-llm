@@ -593,15 +593,17 @@ cmd_deploy() {
 # ------------------------------------------------------------------------------
 cmd_monitor() {
     load_config 2>/dev/null || true
-    local interval="${1:-30}"
+    local interval=15
+    local col_w=14
+    local lbl_w=18
 
     log_section "Heartbeat Monitor"
-    log "Checking every ${interval}s — press Ctrl+C to stop all servers"
+    log "Rolling table every ${interval}s — press Ctrl+C to stop all servers"
     echo
 
-    # On Ctrl+C: gracefully stop both servers then exit
     trap '
         echo
+        tput cnorm 2>/dev/null || true
         log_warn "Ctrl+C received — stopping servers..."
         cmd_stop_llama 2>/dev/null || true
         cmd_stop_rpc   2>/dev/null || true
@@ -609,129 +611,152 @@ cmd_monitor() {
         exit 0
     ' INT TERM
 
+    local -a labels=("Mac memory" "Mac GPU" "DGX memory" "DGX GPU" "rpc-server" "llama-server" "pp (t/s)" "tg (t/s)" "reqs processing" "prompt tokens" "gen tokens")
+    local n_rows=${#labels[@]}
+    local table_h=$(( n_rows + 3 ))  # header + separator + rows + bottom
+
+    # History arrays: h_ts for timestamps, h0..h10 for each row
+    local -a h_ts=()
+    local -a h0=() h1=() h2=() h3=() h4=() h5=() h6=() h7=() h8=() h9=() h10=()
+
+    # Reserve vertical space for the table
+    local i
+    for (( i = 0; i < table_h; i++ )); do echo; done
+
+    tput civis 2>/dev/null || true  # hide cursor during redraw
+
     while true; do
         local ts; ts="$(date '+%H:%M:%S')"
-        local llama_ok=0 rpc_ok=0
 
-        printf "${BOLD}${CYAN}── heartbeat %s ──${RESET}\n" "${ts}"
-
-        # -- Mac memory (vm_stat is instant; memory_pressure takes ~1-2s) --
+        # -- Collect Mac memory (vm_stat — instant) --
+        local v0="--"
         local vm_out page_sz total_bytes
         vm_out="$(vm_stat 2>/dev/null || true)"
         page_sz="$(echo "${vm_out}" | awk -F'[()]' '/page size of/{gsub(/[^0-9]/,"",$2); print $2}')"
         total_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
         if [[ -n "${page_sz}" ]] && (( total_bytes > 0 )); then
-            local free_p spec_p inac_p mac_used mac_total mac_pct
-            free_p="$(echo "${vm_out}" | awk '/Pages free/{gsub(/\./,""); print $3}')"
-            spec_p="$(echo "${vm_out}" | awk '/Pages speculative/{gsub(/\./,""); print $3}')"
-            inac_p="$(echo "${vm_out}" | awk '/Pages inactive/{gsub(/\./,""); print $3}')"
-            mac_total="$(echo "scale=1; ${total_bytes} / 1073741824" | bc)"
-            local mac_free
-            mac_free="$(echo "scale=1; (${free_p:-0} + ${spec_p:-0} + ${inac_p:-0}) * ${page_sz} / 1073741824" | bc)"
-            mac_used="$(echo "scale=1; ${mac_total} - ${mac_free}" | bc)"
-            mac_pct="$(echo "scale=0; ${mac_used} * 100 / ${mac_total}" | bc)"
-            printf "${CYAN}  Mac memory:      %.1fG / %.1fG (%d%%)${RESET}\n" "${mac_used}" "${mac_total}" "${mac_pct}"
+            local fp sp ip mt mf mu mp
+            fp="$(echo "${vm_out}" | awk '/Pages free/{gsub(/\./,""); print $3}')"
+            sp="$(echo "${vm_out}" | awk '/Pages speculative/{gsub(/\./,""); print $3}')"
+            ip="$(echo "${vm_out}" | awk '/Pages inactive/{gsub(/\./,""); print $3}')"
+            mt="$(echo "scale=1; ${total_bytes} / 1073741824" | bc)"
+            mf="$(echo "scale=1; (${fp:-0} + ${sp:-0} + ${ip:-0}) * ${page_sz} / 1073741824" | bc)"
+            mu="$(echo "scale=1; ${mt} - ${mf}" | bc)"
+            mp="$(echo "scale=0; ${mu} * 100 / ${mt}" | bc)"
+            v0="$(printf "%.0fG %d%%" "${mu}" "${mp}")"
         fi
 
-        # -- Mac GPU utilization (ioreg — instant, no sudo) --
-        local mac_gpu_util
-        mac_gpu_util="$(ioreg -r -d 1 -c IOAccelerator 2>/dev/null \
+        # -- Collect Mac GPU (ioreg — instant, no sudo) --
+        local v1="--"
+        local mgu
+        mgu="$(ioreg -r -d 1 -c IOAccelerator 2>/dev/null \
             | grep -o '"Device Utilization %"=[0-9]*' \
             | grep -o '[0-9]*$' | head -1 || true)"
-        if [[ -n "${mac_gpu_util}" ]]; then
-            printf "${CYAN}  Mac GPU util:    %d%%${RESET}\n" "${mac_gpu_util}"
-        fi
+        [[ -n "${mgu}" ]] && v1="${mgu}%"
 
-        # -- DGX stats (single SSH call for memory + GPU + rpc-server check) --
+        # -- Collect DGX stats (single SSH call) --
+        local v2="--" v3="--" v4="--"
         if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
                 "${DGX_USER}@${DGX_HOST}" &>/dev/null 2>&1; then
-            local dgx_stats=""
-            dgx_stats="$(ssh_dgx bash -c "'
+            local ds=""
+            ds="$(ssh_dgx bash -c "'
                 echo \"MEM:\$(free -m 2>/dev/null | awk \"/^Mem:/{printf \\\"%d %d\\\", \\\$3, \\\$2}\")\"
                 echo \"GPU_UTIL:\$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d \" \")\"
                 echo \"GPU_MEM:\$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)\"
                 echo \"RPC:\$(pgrep -x rpc-server >/dev/null 2>&1 && echo UP || echo DOWN)\"
             '" 2>/dev/null || true)"
 
-            if [[ -n "${dgx_stats}" ]]; then
-                # Parse DGX RAM
-                local dgx_mem_line
-                dgx_mem_line="$(echo "${dgx_stats}" | grep '^MEM:' | sed 's/^MEM://')"
-                if [[ -n "${dgx_mem_line}" ]]; then
-                    local dgx_used_m dgx_total_m
-                    read -r dgx_used_m dgx_total_m <<< "${dgx_mem_line}"
-                    if [[ -n "${dgx_total_m}" ]] && (( dgx_total_m > 0 )); then
-                        local dgx_used_g dgx_total_g dgx_pct
-                        dgx_used_g="$(echo "scale=1; ${dgx_used_m} / 1024" | bc)"
-                        dgx_total_g="$(echo "scale=1; ${dgx_total_m} / 1024" | bc)"
-                        dgx_pct=$(( dgx_used_m * 100 / dgx_total_m ))
-                        printf "${CYAN}  DGX memory:      %.1fG / %.1fG (%d%%)${RESET}\n" "${dgx_used_g}" "${dgx_total_g}" "${dgx_pct}"
+            if [[ -n "${ds}" ]]; then
+                local ml; ml="$(echo "${ds}" | grep '^MEM:' | sed 's/^MEM://')"
+                if [[ -n "${ml}" ]]; then
+                    local dm dt
+                    read -r dm dt <<< "${ml}"
+                    if [[ -n "${dt}" ]] && (( dt > 0 )); then
+                        v2="$(printf "%dG %d%%" "$(( dm / 1024 ))" "$(( dm * 100 / dt ))")"
                     fi
                 fi
-
-                # Parse DGX GPU utilization + memory (handle UMA)
-                local dgx_gpu_util dgx_gpu_mem_raw
-                dgx_gpu_util="$(echo "${dgx_stats}" | grep '^GPU_UTIL:' | sed 's/^GPU_UTIL://')"
-                dgx_gpu_mem_raw="$(echo "${dgx_stats}" | grep '^GPU_MEM:' | sed 's/^GPU_MEM://')"
-                if [[ "${dgx_gpu_mem_raw}" =~ ^[0-9] ]]; then
-                    local gm_used gm_total
-                    IFS=', ' read -r gm_used gm_total <<< "${dgx_gpu_mem_raw}"
-                    printf "${CYAN}  DGX GPU:         util %s%%, mem %dMiB / %dMiB${RESET}\n" \
-                        "${dgx_gpu_util:-N/A}" "${gm_used}" "${gm_total}"
-                elif [[ -n "${dgx_gpu_util}" ]]; then
-                    printf "${CYAN}  DGX GPU:         util %s%% (UMA — shared memory)${RESET}\n" "${dgx_gpu_util}"
+                local gu gm
+                gu="$(echo "${ds}" | grep '^GPU_UTIL:' | sed 's/^GPU_UTIL://')"
+                gm="$(echo "${ds}" | grep '^GPU_MEM:' | sed 's/^GPU_MEM://')"
+                if [[ "${gm}" =~ ^[0-9] ]]; then
+                    local mu2 mt2; IFS=', ' read -r mu2 mt2 <<< "${gm}"
+                    v3="$(printf "%s%% %dM" "${gu:-?}" "${mu2}")"
+                elif [[ -n "${gu}" ]]; then
+                    v3="${gu}% UMA"
                 fi
-
-                # Parse RPC status
-                local dgx_rpc_status
-                dgx_rpc_status="$(echo "${dgx_stats}" | grep '^RPC:' | sed 's/^RPC://')"
-                if [[ "${dgx_rpc_status}" == "UP" ]]; then
-                    rpc_ok=1
-                    printf "${GREEN}  rpc-server       UP    %s:%s${RESET}\n" "${DGX_HOST}" "${DGX_RPC_PORT}"
-                else
-                    printf "${RED}  rpc-server       DOWN  %s:%s${RESET}\n" "${DGX_HOST}" "${DGX_RPC_PORT}"
-                fi
+                v4="$(echo "${ds}" | grep '^RPC:' | sed 's/^RPC://')"
             fi
-        else
-            printf "${YELLOW}  rpc-server       UNKNOWN (SSH master inactive)${RESET}\n"
         fi
 
-        # -- llama-server health --
+        # -- Collect llama-server health + metrics --
+        local v5="DOWN" v6="--" v7="--" v8="--" v9="--" v10="--"
         if curl -sf "http://127.0.0.1:${LLAMA_PORT}/health" &>/dev/null; then
-            llama_ok=1
-            printf "${GREEN}  llama-server     UP    http://127.0.0.1:%s${RESET}\n" "${LLAMA_PORT}"
-        else
-            printf "${RED}  llama-server     DOWN  http://127.0.0.1:%s${RESET}\n" "${LLAMA_PORT}"
-        fi
-
-        # -- llama-server metrics --
-        if (( llama_ok )); then
-            local metrics=""
-            metrics="$(curl -sf "http://127.0.0.1:${LLAMA_PORT}/metrics" 2>/dev/null || true)"
-            if [[ -n "${metrics}" ]]; then
-                local prompt_tps="" gen_tps="" reqs="" tokens_gen="" tokens_prompt=""
-
-                prompt_tps="$(echo "${metrics}" | awk '/^llamacpp:prompt_tokens_seconds[{ ]/{print $NF; exit}')"
-                gen_tps="$(echo "${metrics}" | awk '/^llamacpp:predicted_tokens_seconds[{ ]/{print $NF; exit}')"
-                reqs="$(echo "${metrics}" | awk '/^llamacpp:requests_processing[{ ]/{print $NF; exit}')"
-                tokens_prompt="$(echo "${metrics}" | awk '/^llamacpp:prompt_tokens_total[{ ]/{print $NF; exit}')"
-                tokens_gen="$(echo "${metrics}" | awk '/^llamacpp:tokens_predicted_total[{ ]/{print $NF; exit}')"
-
-                local parts=()
-                [[ -n "${prompt_tps}" ]]    && parts+=("pp ${prompt_tps} t/s")
-                [[ -n "${gen_tps}" ]]       && parts+=("tg ${gen_tps} t/s")
-                [[ -n "${reqs}" ]]          && parts+=("reqs ${reqs}")
-                [[ -n "${tokens_prompt}" ]] && parts+=("prompt_tok ${tokens_prompt}")
-                [[ -n "${tokens_gen}" ]]    && parts+=("gen_tok ${tokens_gen}")
-
-                if (( ${#parts[@]} > 0 )); then
-                    local IFS=', '
-                    printf "${CYAN}  metrics:         %s${RESET}\n" "${parts[*]}"
-                fi
+            v5="UP"
+            local met
+            met="$(curl -sf "http://127.0.0.1:${LLAMA_PORT}/metrics" 2>/dev/null || true)"
+            if [[ -n "${met}" ]]; then
+                local x
+                x="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_seconds[{ ]/{print $NF; exit}')";    [[ -n "$x" ]] && v6="$x"
+                x="$(echo "${met}" | awk '/^llamacpp:predicted_tokens_seconds[{ ]/{print $NF; exit}')";  [[ -n "$x" ]] && v7="$x"
+                x="$(echo "${met}" | awk '/^llamacpp:requests_processing[{ ]/{print $NF; exit}')";       [[ -n "$x" ]] && v8="$x"
+                x="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_total[{ ]/{print $NF; exit}')";        [[ -n "$x" ]] && v9="$x"
+                x="$(echo "${met}" | awk '/^llamacpp:tokens_predicted_total[{ ]/{print $NF; exit}')";     [[ -n "$x" ]] && v10="$x"
             fi
         fi
 
-        echo
+        # -- Append to history --
+        h_ts+=("${ts}")
+        h0+=("${v0}"); h1+=("${v1}"); h2+=("${v2}"); h3+=("${v3}"); h4+=("${v4}")
+        h5+=("${v5}"); h6+=("${v6}"); h7+=("${v7}"); h8+=("${v8}"); h9+=("${v9}"); h10+=("${v10}")
+
+        # -- Calculate rolling window --
+        local tw mc total start
+        tw="$(tput cols 2>/dev/null || echo 120)"
+        mc=$(( (tw - lbl_w - 1) / (col_w + 3) ))
+        (( mc < 1 )) && mc=1
+        total=${#h_ts[@]}
+        start=0
+        (( total > mc )) && start=$(( total - mc ))
+
+        # -- Draw table (cursor up to overwrite previous) --
+        printf "\033[${table_h}A"
+
+        # Header row (timestamps)
+        printf "\033[2K${BOLD}%-${lbl_w}s${RESET}" ""
+        for (( i = start; i < total; i++ )); do
+            printf " │ ${CYAN}%-${col_w}s${RESET}" "${h_ts[$i]}"
+        done
+        printf "\n"
+
+        # Separator
+        local sep
+        sep="$(printf '%*s' "${lbl_w}" '' | tr ' ' '─')"
+        printf "\033[2K%s" "${sep}"
+        for (( i = start; i < total; i++ )); do
+            printf "─┼─%s" "$(printf '%*s' "${col_w}" '' | tr ' ' '─')"
+        done
+        printf "\n"
+
+        # Data rows
+        local r val color
+        for (( r = 0; r < n_rows; r++ )); do
+            printf "\033[2K${BOLD}%-${lbl_w}s${RESET}" "${labels[$r]}"
+            for (( i = start; i < total; i++ )); do
+                eval "val=\"\${h${r}[\$i]}\""
+                color="${RESET}"
+                [[ "${val}" == "UP" ]]   && color="${GREEN}"
+                [[ "${val}" == "DOWN" ]] && color="${RED}"
+                printf " │ ${color}%${col_w}s${RESET}" "${val}"
+            done
+            printf "\n"
+        done
+
+        # Bottom border
+        printf "\033[2K%s" "${sep}"
+        for (( i = start; i < total; i++ )); do
+            printf "─┴─%s" "$(printf '%*s' "${col_w}" '' | tr ' ' '─')"
+        done
+        printf "\n"
 
         sleep "${interval}"
     done
