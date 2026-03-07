@@ -152,7 +152,7 @@ cmd_build_dgx() {
 
     log "Syncing source to DGX:${DGX_REMOTE_DIR} ..."
     ssh_dgx "mkdir -p '${DGX_REMOTE_DIR}'"
-    rsync -az --info=progress2 \
+    rsync -az --progress \
         --exclude='.git' \
         --exclude='build/' \
         --exclude='*.o' \
@@ -196,7 +196,7 @@ cmd_build_dgx() {
 
     log "Syncing source to ${DGX_USER}@${DGX_HOST}:${DGX_REMOTE_DIR} ..."
     ssh_dgx "mkdir -p '${DGX_REMOTE_DIR}'"
-    rsync -az --info=progress2 \
+    rsync -az --progress \
         --exclude='.git' \
         --exclude='build/' \
         --exclude='*.o' \
