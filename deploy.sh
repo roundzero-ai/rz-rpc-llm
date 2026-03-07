@@ -594,7 +594,7 @@ cmd_deploy() {
 cmd_monitor() {
     load_config 2>/dev/null || true
     local interval="${1:-30}"
-    local min_cols=10
+    local col_w=10
     local lbl_w=18
 
     log_section "Heartbeat Monitor"
@@ -643,7 +643,7 @@ cmd_monitor() {
             mf="$(echo "scale=1; (${fp:-0} + ${sp:-0} + ${ip:-0}) * ${page_sz} / 1073741824" | bc)"
             mu="$(echo "scale=1; ${mt} - ${mf}" | bc)"
             mp="$(echo "scale=0; ${mu} * 100 / ${mt}" | bc)"
-            v0="$(printf "%.0fG %d%%" "${mu}" "${mp}")"
+            v0="$(printf "%.0fG/%d%%" "${mu}" "${mp}")"
         fi
 
         # -- Collect Mac GPU (ioreg — instant, no sudo) --
@@ -672,7 +672,7 @@ cmd_monitor() {
                     local dm dt
                     read -r dm dt <<< "${ml}"
                     if [[ -n "${dt}" ]] && (( dt > 0 )); then
-                        v2="$(printf "%dG %d%%" "$(( dm / 1024 ))" "$(( dm * 100 / dt ))")"
+                        v2="$(printf "%dG/%d%%" "$(( dm / 1024 ))" "$(( dm * 100 / dt ))")"
                     fi
                 fi
                 local gu gm
@@ -680,9 +680,10 @@ cmd_monitor() {
                 gm="$(echo "${ds}" | grep '^GPU_MEM:' | sed 's/^GPU_MEM://')"
                 if [[ "${gm}" =~ ^[0-9] ]]; then
                     local mu2 mt2; IFS=', ' read -r mu2 mt2 <<< "${gm}"
-                    v3="$(printf "%s%% %dM" "${gu:-?}" "${mu2}")"
+                    local gm_gb; gm_gb="$(echo "scale=0; ${mu2} / 1024" | bc)"
+                    v3="$(printf "%s%%/%dG" "${gu:-?}" "${gm_gb}")"
                 elif [[ -n "${gu}" ]]; then
-                    v3="${gu}% UMA"
+                    v3="${gu}%/UMA"
                 fi
                 v4="$(echo "${ds}" | grep '^RPC:' | sed 's/^RPC://')"
             fi
@@ -696,11 +697,11 @@ cmd_monitor() {
             met="$(curl -sf "http://127.0.0.1:${LLAMA_PORT}/metrics" 2>/dev/null || true)"
             if [[ -n "${met}" ]]; then
                 local x
-                x="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_seconds[{ ]/{print $NF; exit}')";    [[ -n "$x" ]] && v6="$x"
-                x="$(echo "${met}" | awk '/^llamacpp:predicted_tokens_seconds[{ ]/{print $NF; exit}')";  [[ -n "$x" ]] && v7="$x"
-                x="$(echo "${met}" | awk '/^llamacpp:requests_processing[{ ]/{print $NF; exit}')";       [[ -n "$x" ]] && v8="$x"
-                x="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_total[{ ]/{print $NF; exit}')";        [[ -n "$x" ]] && v9="$x"
-                x="$(echo "${met}" | awk '/^llamacpp:tokens_predicted_total[{ ]/{print $NF; exit}')";     [[ -n "$x" ]] && v10="$x"
+                x="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_seconds[{ ]/{printf "%.1f", $NF; exit}')";    [[ -n "$x" ]] && v6="$x"
+                x="$(echo "${met}" | awk '/^llamacpp:predicted_tokens_seconds[{ ]/{printf "%.1f", $NF; exit}')"; [[ -n "$x" ]] && v7="$x"
+                x="$(echo "${met}" | awk '/^llamacpp:requests_processing[{ ]/{printf "%d", $NF; exit}')";        [[ -n "$x" ]] && v8="$x"
+                x="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_total[{ ]/{v=$NF; if(v>=1e6) printf "%.1fM",v/1e6; else if(v>=1e3) printf "%.1fK",v/1e3; else printf "%d",v; exit}')";        [[ -n "$x" ]] && v9="$x"
+                x="$(echo "${met}" | awk '/^llamacpp:tokens_predicted_total[{ ]/{v=$NF; if(v>=1e6) printf "%.1fM",v/1e6; else if(v>=1e3) printf "%.1fK",v/1e3; else printf "%d",v; exit}')";     [[ -n "$x" ]] && v10="$x"
             fi
         fi
 
@@ -710,15 +711,9 @@ cmd_monitor() {
         h5+=("${v5}"); h6+=("${v6}"); h7+=("${v7}"); h8+=("${v8}"); h9+=("${v9}"); h10+=("${v10}")
 
         # -- Calculate rolling window --
-        local tw col_w mc total start
+        local tw mc total start
         tw="$(tput cols 2>/dev/null || echo 120)"
-        # Preferred 14-char columns, shrink to min 10 to fit more columns
-        col_w=14
         mc=$(( (tw - lbl_w - 1) / (col_w + 3) ))
-        if (( mc < min_cols )); then
-            col_w=10
-            mc=$(( (tw - lbl_w - 1) / (col_w + 3) ))
-        fi
         (( mc < 1 )) && mc=1
         total=${#h_ts[@]}
         start=0
