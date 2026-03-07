@@ -456,27 +456,32 @@ cmd_start_llama() {
     local llama_pid=$!
     echo "${llama_pid}" > "${pid_file}"
 
-    log "PID ${llama_pid} — waiting for server to become ready..."
-    local retries=30
-    while (( retries-- > 0 )); do
+    # Poll health — 2s intervals, 10 min ceiling (large model loads take time)
+    log "PID ${llama_pid} — polling health every 2s (up to 10 min)..."
+    local elapsed=0
+    local limit=600
+    while (( elapsed < limit )); do
         if curl -sf "http://127.0.0.1:${LLAMA_PORT}/health" &>/dev/null; then
-            log_ok "llama-server ready at http://${LLAMA_HOST}:${LLAMA_PORT}"
+            echo
+            log_ok "llama-server ready in ${elapsed}s"
             log_ok "OpenAI-compatible endpoint: http://127.0.0.1:${LLAMA_PORT}/v1"
             log_ok "Metrics: http://127.0.0.1:${LLAMA_PORT}/metrics"
             log "Log: ${log_file}"
             return 0
         fi
         if ! kill -0 "${llama_pid}" 2>/dev/null; then
+            echo
             log_error "llama-server exited unexpectedly. Last log lines:"
             tail -30 "${log_file}" >&2
             die "llama-server failed to start"
         fi
-        printf '.'
+        printf '\r[%s] Loading model... %ds elapsed (Ctrl+C to abort wait)' \
+            "$(date '+%H:%M:%S')" "${elapsed}"
         sleep 2
+        (( elapsed += 2 ))
     done
     echo
-    log_warn "Server did not respond within timeout — check logs: ${log_file}"
-    log_warn "It may still be loading the model. Try: ./deploy.sh status"
+    log_warn "Server did not respond within ${limit}s — check logs: ${log_file}"
 }
 
 # ------------------------------------------------------------------------------
@@ -563,10 +568,76 @@ cmd_deploy() {
     [[ -n "${model_alias}" ]] && llama_args+=(--alias "${model_alias}")
     cmd_start_llama "${llama_args[@]+"${llama_args[@]}"}"
 
+    # Block here until health is confirmed (model may still be loading after start-llama returns)
+    log "Waiting for confirmed health check before declaring complete..."
+    until curl -sf "http://127.0.0.1:${LLAMA_PORT}/health" &>/dev/null; do
+        if ! pgrep -x llama-server &>/dev/null; then
+            die "llama-server is no longer running"
+        fi
+        printf '\r[%s] Still loading...' "$(date '+%H:%M:%S')"
+        sleep 5
+    done
+    echo
+
     log_section "Deploy Complete"
     log_ok "RPC server : ${DGX_HOST}:${DGX_RPC_PORT}"
     log_ok "LLM server : http://${LLAMA_HOST}:${LLAMA_PORT}"
     log_ok "OpenAI API : http://127.0.0.1:${LLAMA_PORT}/v1"
+    log_ok "Metrics   : http://127.0.0.1:${LLAMA_PORT}/metrics"
+
+    cmd_monitor
+}
+
+# ------------------------------------------------------------------------------
+# Command: monitor  — heartbeat loop, Ctrl+C to stop all servers
+# ------------------------------------------------------------------------------
+cmd_monitor() {
+    load_config 2>/dev/null || true
+    local interval="${1:-30}"
+
+    log_section "Heartbeat Monitor"
+    log "Checking every ${interval}s — press Ctrl+C to stop all servers"
+    echo
+
+    # On Ctrl+C: gracefully stop both servers then exit
+    trap '
+        echo
+        log_warn "Ctrl+C received — stopping servers..."
+        cmd_stop_llama 2>/dev/null || true
+        cmd_stop_rpc   2>/dev/null || true
+        log_ok "Servers stopped. Goodbye."
+        exit 0
+    ' INT TERM
+
+    while true; do
+        local ts; ts="$(date '+%H:%M:%S')"
+        local llama_ok=0 rpc_ok=0
+
+        # llama-server health
+        if curl -sf "http://127.0.0.1:${LLAMA_PORT}/health" &>/dev/null; then
+            llama_ok=1
+            printf "${GREEN}[%s] llama-server  UP    http://127.0.0.1:%s${RESET}\n" "${ts}" "${LLAMA_PORT}"
+        else
+            printf "${RED}[%s] llama-server  DOWN  http://127.0.0.1:%s${RESET}\n" "${ts}" "${LLAMA_PORT}"
+        fi
+
+        # rpc-server on DGX (reuse SSH master, non-fatal if unreachable)
+        if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+                "${DGX_USER}@${DGX_HOST}" &>/dev/null 2>&1; then
+            if ssh_dgx "pgrep -x rpc-server" &>/dev/null 2>&1; then
+                rpc_ok=1
+                printf "${GREEN}[%s] rpc-server    UP    %s:%s${RESET}\n" "${ts}" "${DGX_HOST}" "${DGX_RPC_PORT}"
+            else
+                printf "${RED}[%s] rpc-server    DOWN  %s:%s${RESET}\n" "${ts}" "${DGX_HOST}" "${DGX_RPC_PORT}"
+            fi
+        else
+            printf "${YELLOW}[%s] rpc-server    UNKNOWN (SSH master inactive)${RESET}\n" "${ts}"
+        fi
+
+        echo
+
+        sleep "${interval}"
+    done
 }
 
 # ------------------------------------------------------------------------------
@@ -676,6 +747,10 @@ ${BOLD}COMMANDS${RESET}
                  [--skip-clone] [--skip-build] [--skip-download]
       Full pipeline: clone → build-dgx → build-mac → download → start-rpc → start-llama
 
+  ${CYAN}monitor${RESET}  [INTERVAL_SEC]
+      Heartbeat loop — prints health of both servers every N seconds (default 30)
+      Ctrl+C gracefully stops all servers
+
   ${CYAN}status${RESET}
       Show running process status for both devices
 
@@ -721,6 +796,7 @@ main() {
         start-llama) cmd_start_llama "$@" ;;
         stop-llama)  cmd_stop_llama "$@" ;;
         deploy)      cmd_deploy "$@" ;;
+        monitor)     cmd_monitor "$@" ;;
         status)      cmd_status "$@" ;;
         logs)        cmd_logs "$@" ;;
         help|--help|-h) usage ;;
