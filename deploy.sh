@@ -141,52 +141,8 @@ cmd_clone() {
 }
 
 # ------------------------------------------------------------------------------
-# Command: build-dgx
+# Command: build-dgx  (runs entirely on DGX via SSH — Mac has no CUDA)
 # ------------------------------------------------------------------------------
-cmd_build_dgx() {
-    log_section "Build llama.cpp on DGX Spark GB10"
-    load_config
-    check_dgx_ssh
-
-    [[ -d "${LLAMA_CPP_DIR}/.git" ]] || die "llama.cpp not cloned. Run: ./deploy.sh clone"
-
-    log "Syncing source to DGX:${DGX_REMOTE_DIR} ..."
-    ssh_dgx "mkdir -p '${DGX_REMOTE_DIR}'"
-    rsync -az --progress \
-        --exclude='.git' \
-        --exclude='build/' \
-        --exclude='*.o' \
-        "${LLAMA_CPP_DIR}/" \
-        "${DGX_USER}@${DGX_HOST}:${DGX_REMOTE_DIR}/"
-    log_ok "Sync complete"
-
-    log "Building on DGX (CUDA, SM121)..."
-    ssh_dgx bash -s <<'REMOTE_BUILD'
-set -euo pipefail
-LLAMA_DIR="$(echo "${DGX_REMOTE_DIR:-}")"
-# DGX_REMOTE_DIR is inherited via env; fall back to positional if needed
-cd "${DGX_REMOTE_DIR}"
-
-echo "[DGX] cmake configure..."
-cmake -B build \
-    -DGGML_CUDA=ON \
-    -DGGML_CUDA_FA_ALL_QUANTS=ON \
-    -DCMAKE_CUDA_ARCHITECTURES="121" \
-    -DGGML_CPU_AARCH64=ON \
-    -DBUILD_SHARED_LIBS=OFF \
-    -DGGML_RPC=ON \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DLLAMA_FLASH_ATTENTION=ON
-
-echo "[DGX] cmake build ($(nproc) jobs)..."
-cmake --build build --config Release -j$(nproc)
-
-echo "[DGX] Build complete: $(ls build/bin/)"
-REMOTE_BUILD
-    log_ok "DGX build complete"
-}
-
-# Override DGX_REMOTE_DIR in SSH environment
 cmd_build_dgx() {
     log_section "Build llama.cpp on DGX Spark GB10"
     load_config
