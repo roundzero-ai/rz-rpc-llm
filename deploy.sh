@@ -178,30 +178,30 @@ cmd_build_dgx() {
         "${DGX_USER}@${DGX_HOST}:${DGX_REMOTE_DIR}/"
     log_ok "Sync complete"
 
-    log "Building on DGX (CUDA, SM121, $(ssh_dgx nproc) cores)..."
-    # Prepend DGX_CUDA_BIN so nvcc is found in the non-interactive SSH session
-    # (SSH does not source .bashrc/.profile, so CUDA is not in PATH by default)
-    local cuda_bin="${DGX_CUDA_BIN:-/usr/local/cuda/bin}"
-    log "CUDA bin : ${cuda_bin}"
-    ssh_dgx "
-        export PATH='${cuda_bin}:\$PATH'
-        set -euo pipefail
-        cd '${DGX_REMOTE_DIR}'
-        echo '[DGX] nvcc:' \$(which nvcc 2>/dev/null || echo 'NOT FOUND — check DGX_CUDA_BIN in config.env')
-        echo '[DGX] cmake configure...'
-        cmake -B build \
-            -DGGML_CUDA=ON \
-            -DGGML_CUDA_FA_ALL_QUANTS=ON \
-            -DCMAKE_CUDA_ARCHITECTURES='121' \
-            -DGGML_CPU_AARCH64=ON \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DGGML_RPC=ON \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLAMA_FLASH_ATTENTION=ON \
-            && cmake --build build --config Release -j\$(nproc)
-        echo '[DGX] Executables built:'
-        find build -type f -executable ! -name '*.so' | sort | sed 's/^/  /'
-    "
+    # Use bash -l (login shell) so the full PATH from .profile/.bashrc is loaded.
+    # Non-interactive SSH has a bare PATH — cmake, nvcc, find, etc. are all missing.
+    # Unquoted heredoc: ${DGX_REMOTE_DIR} expands on Mac side; \$(nproc) on DGX side.
+    log "Building on DGX (login shell, CUDA SM121)..."
+    ssh_dgx bash -l << ENDSSH
+set -euo pipefail
+cd '${DGX_REMOTE_DIR}'
+echo "[DGX] PATH: \$PATH"
+echo "[DGX] cmake: \$(which cmake 2>/dev/null || echo NOT FOUND)"
+echo "[DGX] nvcc:  \$(which nvcc  2>/dev/null || echo NOT FOUND)"
+echo "[DGX] cmake configure..."
+cmake -B build \
+    -DGGML_CUDA=ON \
+    -DGGML_CUDA_FA_ALL_QUANTS=ON \
+    -DCMAKE_CUDA_ARCHITECTURES="121" \
+    -DGGML_CPU_AARCH64=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DGGML_RPC=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLAMA_FLASH_ATTENTION=ON \
+    && cmake --build build --config Release -j\$(nproc)
+echo "[DGX] Executables built:"
+find build -type f -executable ! -name '*.so' | sort | sed 's/^/  /'
+ENDSSH
     log_ok "DGX build complete"
 }
 
