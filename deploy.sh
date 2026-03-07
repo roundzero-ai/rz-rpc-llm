@@ -594,8 +594,8 @@ cmd_deploy() {
 cmd_monitor() {
     load_config 2>/dev/null || true
     local interval="${1:-30}"
-    local col_w=10
     local lbl_w=18
+    local min_col_w=10
 
     log_section "Heartbeat Monitor"
     log "Rolling table every ${interval}s — press Ctrl+C to stop all servers"
@@ -710,14 +710,21 @@ cmd_monitor() {
         h0+=("${v0}"); h1+=("${v1}"); h2+=("${v2}"); h3+=("${v3}"); h4+=("${v4}")
         h5+=("${v5}"); h6+=("${v6}"); h7+=("${v7}"); h8+=("${v8}"); h9+=("${v9}"); h10+=("${v10}")
 
-        # -- Calculate rolling window --
-        local tw mc total start
+        # -- Calculate rolling window (fill terminal width) --
+        local tw col_w mc total start
         tw="$(tput cols 2>/dev/null || echo 120)"
-        mc=$(( (tw - lbl_w - 1) / (col_w + 3) ))
-        (( mc < 1 )) && mc=1
         total=${#h_ts[@]}
+        # Determine how many columns we can show (at minimum col width)
+        mc=$(( (tw - lbl_w - 1) / (min_col_w + 3) ))
+        (( mc < 1 )) && mc=1
+        # Cap to available data
+        local visible=$(( total < mc ? total : mc ))
+        (( visible < 1 )) && visible=1
+        # Expand column width to fill the terminal
+        col_w=$(( (tw - lbl_w - 1) / visible - 3 ))
+        (( col_w < min_col_w )) && col_w=${min_col_w}
         start=0
-        (( total > mc )) && start=$(( total - mc ))
+        (( total > visible )) && start=$(( total - visible ))
 
         # -- Draw table (cursor up to overwrite previous) --
         printf "\033[${table_h}A"
