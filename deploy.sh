@@ -613,25 +613,81 @@ cmd_monitor() {
         local ts; ts="$(date '+%H:%M:%S')"
         local llama_ok=0 rpc_ok=0
 
-        # llama-server health
-        if curl -sf "http://127.0.0.1:${LLAMA_PORT}/health" &>/dev/null; then
-            llama_ok=1
-            printf "${GREEN}[%s] llama-server  UP    http://127.0.0.1:%s${RESET}\n" "${ts}" "${LLAMA_PORT}"
-        else
-            printf "${RED}[%s] llama-server  DOWN  http://127.0.0.1:%s${RESET}\n" "${ts}" "${LLAMA_PORT}"
+        printf "${BOLD}${CYAN}── heartbeat %s ──${RESET}\n" "${ts}"
+
+        # -- Mac memory pressure --
+        local mac_mem=""
+        mac_mem="$(memory_pressure 2>/dev/null | grep 'System-wide memory free percentage' | awk '{print $NF}' || true)"
+        if [[ -n "${mac_mem}" ]]; then
+            printf "${CYAN}  Mac memory free: %s${RESET}\n" "${mac_mem}"
         fi
 
-        # rpc-server on DGX (reuse SSH master, non-fatal if unreachable)
+        # -- DGX memory pressure --
+        if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+                "${DGX_USER}@${DGX_HOST}" &>/dev/null 2>&1; then
+            local dgx_mem=""
+            dgx_mem="$(ssh_dgx "free -h 2>/dev/null | awk '/^Mem:/{printf \"used %s / total %s (avail %s)\", \$3, \$2, \$7}'" 2>/dev/null || true)"
+            if [[ -n "${dgx_mem}" ]]; then
+                printf "${CYAN}  DGX memory:      %s${RESET}\n" "${dgx_mem}"
+            fi
+            local dgx_gpu_mem=""
+            dgx_gpu_mem="$(ssh_dgx "nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '{printf \"used %dMiB / total %dMiB (%.0f%%)\", \$1, \$2, \$1/\$2*100}'" 2>/dev/null || true)"
+            if [[ -n "${dgx_gpu_mem}" ]]; then
+                printf "${CYAN}  DGX GPU memory:  %s${RESET}\n" "${dgx_gpu_mem}"
+            fi
+        fi
+
+        # -- llama-server health --
+        if curl -sf "http://127.0.0.1:${LLAMA_PORT}/health" &>/dev/null; then
+            llama_ok=1
+            printf "${GREEN}  llama-server     UP    http://127.0.0.1:%s${RESET}\n" "${LLAMA_PORT}"
+        else
+            printf "${RED}  llama-server     DOWN  http://127.0.0.1:%s${RESET}\n" "${LLAMA_PORT}"
+        fi
+
+        # -- llama-server metrics --
+        if (( llama_ok )); then
+            local metrics=""
+            metrics="$(curl -sf "http://127.0.0.1:${LLAMA_PORT}/metrics" 2>/dev/null || true)"
+            if [[ -n "${metrics}" ]]; then
+                local prompt_tps="" gen_tps="" reqs="" tokens_gen="" tokens_prompt=""
+
+                # Prompt processing tokens/sec (gauge)
+                prompt_tps="$(echo "${metrics}" | awk '/^llamacpp:prompt_tokens_seconds[{ ]/{print $NF; exit}')"
+                # Token generation tokens/sec (gauge)
+                gen_tps="$(echo "${metrics}" | awk '/^llamacpp:tokens_seconds[{ ]/{print $NF; exit}')"
+                # Requests processing (gauge for in-flight)
+                reqs="$(echo "${metrics}" | awk '/^llamacpp:requests_processing[{ ]/{print $NF; exit}')"
+                # Total prompt tokens (counter)
+                tokens_prompt="$(echo "${metrics}" | awk '/^llamacpp:prompt_tokens_total[{ ]/{print $NF; exit}')"
+                # Total generation tokens (counter)
+                tokens_gen="$(echo "${metrics}" | awk '/^llamacpp:tokens_predicted_total[{ ]/{print $NF; exit}')"
+
+                local parts=()
+                [[ -n "${prompt_tps}" ]]    && parts+=("pp ${prompt_tps} t/s")
+                [[ -n "${gen_tps}" ]]       && parts+=("tg ${gen_tps} t/s")
+                [[ -n "${reqs}" ]]          && parts+=("reqs ${reqs}")
+                [[ -n "${tokens_prompt}" ]] && parts+=("prompt_tok ${tokens_prompt}")
+                [[ -n "${tokens_gen}" ]]    && parts+=("gen_tok ${tokens_gen}")
+
+                if (( ${#parts[@]} > 0 )); then
+                    local IFS=', '
+                    printf "${CYAN}  metrics:         %s${RESET}\n" "${parts[*]}"
+                fi
+            fi
+        fi
+
+        # -- rpc-server on DGX --
         if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
                 "${DGX_USER}@${DGX_HOST}" &>/dev/null 2>&1; then
             if ssh_dgx "pgrep -x rpc-server" &>/dev/null 2>&1; then
                 rpc_ok=1
-                printf "${GREEN}[%s] rpc-server    UP    %s:%s${RESET}\n" "${ts}" "${DGX_HOST}" "${DGX_RPC_PORT}"
+                printf "${GREEN}  rpc-server       UP    %s:%s${RESET}\n" "${DGX_HOST}" "${DGX_RPC_PORT}"
             else
-                printf "${RED}[%s] rpc-server    DOWN  %s:%s${RESET}\n" "${ts}" "${DGX_HOST}" "${DGX_RPC_PORT}"
+                printf "${RED}  rpc-server       DOWN  %s:%s${RESET}\n" "${DGX_HOST}" "${DGX_RPC_PORT}"
             fi
         else
-            printf "${YELLOW}[%s] rpc-server    UNKNOWN (SSH master inactive)${RESET}\n" "${ts}"
+            printf "${YELLOW}  rpc-server       UNKNOWN (SSH master inactive)${RESET}\n"
         fi
 
         echo
