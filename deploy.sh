@@ -712,12 +712,11 @@ cmd_monitor() {
         # -- Calculate rolling window --
         local tw col_w mc total start
         tw="$(tput cols 2>/dev/null || echo 120)"
-        # Start with preferred column width, shrink to fit at least min_cols
+        # Preferred 14-char columns, shrink to min 10 to fit more columns
         col_w=14
         mc=$(( (tw - lbl_w - 1) / (col_w + 3) ))
         if (( mc < min_cols )); then
-            col_w=$(( (tw - lbl_w - 1) / (min_cols + 3) - 3 ))
-            (( col_w < 6 )) && col_w=6
+            col_w=10
             mc=$(( (tw - lbl_w - 1) / (col_w + 3) ))
         fi
         (( mc < 1 )) && mc=1
