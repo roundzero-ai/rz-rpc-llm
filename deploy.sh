@@ -615,26 +615,85 @@ cmd_monitor() {
 
         printf "${BOLD}${CYAN}── heartbeat %s ──${RESET}\n" "${ts}"
 
-        # -- Mac memory pressure --
-        local mac_mem=""
-        mac_mem="$(memory_pressure 2>/dev/null | grep 'System-wide memory free percentage' | awk '{print $NF}' || true)"
-        if [[ -n "${mac_mem}" ]]; then
-            printf "${CYAN}  Mac memory free: %s${RESET}\n" "${mac_mem}"
+        # -- Mac memory (vm_stat is instant; memory_pressure takes ~1-2s) --
+        local vm_out page_sz total_bytes
+        vm_out="$(vm_stat 2>/dev/null || true)"
+        page_sz="$(echo "${vm_out}" | awk -F'[()]' '/page size of/{gsub(/[^0-9]/,"",$2); print $2}')"
+        total_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+        if [[ -n "${page_sz}" ]] && (( total_bytes > 0 )); then
+            local free_p spec_p inac_p mac_used mac_total mac_pct
+            free_p="$(echo "${vm_out}" | awk '/Pages free/{gsub(/\./,""); print $3}')"
+            spec_p="$(echo "${vm_out}" | awk '/Pages speculative/{gsub(/\./,""); print $3}')"
+            inac_p="$(echo "${vm_out}" | awk '/Pages inactive/{gsub(/\./,""); print $3}')"
+            mac_total="$(echo "scale=1; ${total_bytes} / 1073741824" | bc)"
+            local mac_free
+            mac_free="$(echo "scale=1; (${free_p:-0} + ${spec_p:-0} + ${inac_p:-0}) * ${page_sz} / 1073741824" | bc)"
+            mac_used="$(echo "scale=1; ${mac_total} - ${mac_free}" | bc)"
+            mac_pct="$(echo "scale=0; ${mac_used} * 100 / ${mac_total}" | bc)"
+            printf "${CYAN}  Mac memory:      %.1fG / %.1fG (%d%%)${RESET}\n" "${mac_used}" "${mac_total}" "${mac_pct}"
         fi
 
-        # -- DGX memory pressure --
+        # -- Mac GPU utilization (ioreg — instant, no sudo) --
+        local mac_gpu_util
+        mac_gpu_util="$(ioreg -r -d 1 -c IOAccelerator 2>/dev/null \
+            | grep -o '"Device Utilization %"=[0-9]*' \
+            | grep -o '[0-9]*$' | head -1 || true)"
+        if [[ -n "${mac_gpu_util}" ]]; then
+            printf "${CYAN}  Mac GPU util:    %d%%${RESET}\n" "${mac_gpu_util}"
+        fi
+
+        # -- DGX stats (single SSH call for memory + GPU + rpc-server check) --
         if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
                 "${DGX_USER}@${DGX_HOST}" &>/dev/null 2>&1; then
-            local dgx_mem=""
-            dgx_mem="$(ssh_dgx "free -h 2>/dev/null | awk '/^Mem:/{printf \"used %s / total %s (avail %s)\", \$3, \$2, \$7}'" 2>/dev/null || true)"
-            if [[ -n "${dgx_mem}" ]]; then
-                printf "${CYAN}  DGX memory:      %s${RESET}\n" "${dgx_mem}"
+            local dgx_stats=""
+            dgx_stats="$(ssh_dgx bash -c "'
+                echo \"MEM:\$(free -m 2>/dev/null | awk \"/^Mem:/{printf \\\"%d %d\\\", \\\$3, \\\$2}\")\"
+                echo \"GPU_UTIL:\$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d \" \")\"
+                echo \"GPU_MEM:\$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)\"
+                echo \"RPC:\$(pgrep -x rpc-server >/dev/null 2>&1 && echo UP || echo DOWN)\"
+            '" 2>/dev/null || true)"
+
+            if [[ -n "${dgx_stats}" ]]; then
+                # Parse DGX RAM
+                local dgx_mem_line
+                dgx_mem_line="$(echo "${dgx_stats}" | grep '^MEM:' | sed 's/^MEM://')"
+                if [[ -n "${dgx_mem_line}" ]]; then
+                    local dgx_used_m dgx_total_m
+                    read -r dgx_used_m dgx_total_m <<< "${dgx_mem_line}"
+                    if [[ -n "${dgx_total_m}" ]] && (( dgx_total_m > 0 )); then
+                        local dgx_used_g dgx_total_g dgx_pct
+                        dgx_used_g="$(echo "scale=1; ${dgx_used_m} / 1024" | bc)"
+                        dgx_total_g="$(echo "scale=1; ${dgx_total_m} / 1024" | bc)"
+                        dgx_pct=$(( dgx_used_m * 100 / dgx_total_m ))
+                        printf "${CYAN}  DGX memory:      %.1fG / %.1fG (%d%%)${RESET}\n" "${dgx_used_g}" "${dgx_total_g}" "${dgx_pct}"
+                    fi
+                fi
+
+                # Parse DGX GPU utilization + memory (handle UMA)
+                local dgx_gpu_util dgx_gpu_mem_raw
+                dgx_gpu_util="$(echo "${dgx_stats}" | grep '^GPU_UTIL:' | sed 's/^GPU_UTIL://')"
+                dgx_gpu_mem_raw="$(echo "${dgx_stats}" | grep '^GPU_MEM:' | sed 's/^GPU_MEM://')"
+                if [[ "${dgx_gpu_mem_raw}" =~ ^[0-9] ]]; then
+                    local gm_used gm_total
+                    IFS=', ' read -r gm_used gm_total <<< "${dgx_gpu_mem_raw}"
+                    printf "${CYAN}  DGX GPU:         util %s%%, mem %dMiB / %dMiB${RESET}\n" \
+                        "${dgx_gpu_util:-N/A}" "${gm_used}" "${gm_total}"
+                elif [[ -n "${dgx_gpu_util}" ]]; then
+                    printf "${CYAN}  DGX GPU:         util %s%% (UMA — shared memory)${RESET}\n" "${dgx_gpu_util}"
+                fi
+
+                # Parse RPC status
+                local dgx_rpc_status
+                dgx_rpc_status="$(echo "${dgx_stats}" | grep '^RPC:' | sed 's/^RPC://')"
+                if [[ "${dgx_rpc_status}" == "UP" ]]; then
+                    rpc_ok=1
+                    printf "${GREEN}  rpc-server       UP    %s:%s${RESET}\n" "${DGX_HOST}" "${DGX_RPC_PORT}"
+                else
+                    printf "${RED}  rpc-server       DOWN  %s:%s${RESET}\n" "${DGX_HOST}" "${DGX_RPC_PORT}"
+                fi
             fi
-            local dgx_gpu_mem=""
-            dgx_gpu_mem="$(ssh_dgx "nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '{printf \"used %dMiB / total %dMiB (%.0f%%)\", \$1, \$2, \$1/\$2*100}'" 2>/dev/null || true)"
-            if [[ -n "${dgx_gpu_mem}" ]]; then
-                printf "${CYAN}  DGX GPU memory:  %s${RESET}\n" "${dgx_gpu_mem}"
-            fi
+        else
+            printf "${YELLOW}  rpc-server       UNKNOWN (SSH master inactive)${RESET}\n"
         fi
 
         # -- llama-server health --
@@ -652,15 +711,10 @@ cmd_monitor() {
             if [[ -n "${metrics}" ]]; then
                 local prompt_tps="" gen_tps="" reqs="" tokens_gen="" tokens_prompt=""
 
-                # Prompt processing tokens/sec (gauge)
                 prompt_tps="$(echo "${metrics}" | awk '/^llamacpp:prompt_tokens_seconds[{ ]/{print $NF; exit}')"
-                # Token generation tokens/sec (gauge)
                 gen_tps="$(echo "${metrics}" | awk '/^llamacpp:tokens_seconds[{ ]/{print $NF; exit}')"
-                # Requests processing (gauge for in-flight)
                 reqs="$(echo "${metrics}" | awk '/^llamacpp:requests_processing[{ ]/{print $NF; exit}')"
-                # Total prompt tokens (counter)
                 tokens_prompt="$(echo "${metrics}" | awk '/^llamacpp:prompt_tokens_total[{ ]/{print $NF; exit}')"
-                # Total generation tokens (counter)
                 tokens_gen="$(echo "${metrics}" | awk '/^llamacpp:tokens_predicted_total[{ ]/{print $NF; exit}')"
 
                 local parts=()
@@ -675,19 +729,6 @@ cmd_monitor() {
                     printf "${CYAN}  metrics:         %s${RESET}\n" "${parts[*]}"
                 fi
             fi
-        fi
-
-        # -- rpc-server on DGX --
-        if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
-                "${DGX_USER}@${DGX_HOST}" &>/dev/null 2>&1; then
-            if ssh_dgx "pgrep -x rpc-server" &>/dev/null 2>&1; then
-                rpc_ok=1
-                printf "${GREEN}  rpc-server       UP    %s:%s${RESET}\n" "${DGX_HOST}" "${DGX_RPC_PORT}"
-            else
-                printf "${RED}  rpc-server       DOWN  %s:%s${RESET}\n" "${DGX_HOST}" "${DGX_RPC_PORT}"
-            fi
-        else
-            printf "${YELLOW}  rpc-server       UNKNOWN (SSH master inactive)${RESET}\n"
         fi
 
         echo
