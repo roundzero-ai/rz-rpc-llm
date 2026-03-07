@@ -1,6 +1,5 @@
 config.env
 llama.cpp/
 models/
-.venv/
 .pids/
 *.log

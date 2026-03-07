@@ -262,24 +262,18 @@ cmd_download() {
 
     mkdir -p "${local_dir}"
 
-    # Set up venv if needed
-    local venv_dir="${SCRIPT_DIR}/.venv"
-    if [[ ! -x "${venv_dir}/bin/python3" ]]; then
-        log "Creating Python venv at ${venv_dir}..."
-        python3 -m venv "${venv_dir}"
+    if ! command -v huggingface-cli &>/dev/null; then
+        die "huggingface-cli not found. Install it with: pip install huggingface_hub"
     fi
-
-    local py="${venv_dir}/bin/python3"
-    log "Installing/upgrading huggingface_hub..."
-    "${py}" -m pip install -q -U "huggingface_hub"
+    log "huggingface-cli: $(command -v huggingface-cli)"
 
     log "Downloading (this may take a while)..."
     if [[ -n "${token}" ]]; then
-        HF_TOKEN="${token}" "${py}" -m huggingface_hub download "${repo}" \
+        HF_TOKEN="${token}" huggingface-cli download "${repo}" \
             --local-dir "${local_dir}" \
             --include "${pattern}"
     else
-        "${py}" -m huggingface_hub download "${repo}" \
+        huggingface-cli download "${repo}" \
             --local-dir "${local_dir}" \
             --include "${pattern}"
     fi
