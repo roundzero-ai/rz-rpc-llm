@@ -543,7 +543,7 @@ cmd_deploy() {
     if (( ! skip_clone )); then
         local clone_args=()
         [[ -n "${tag}" ]] && clone_args+=(--tag "${tag}")
-        cmd_clone "${clone_args[@]}"
+        cmd_clone "${clone_args[@]+"${clone_args[@]}"}"
     fi
 
     if (( ! skip_build )); then
@@ -561,7 +561,7 @@ cmd_deploy() {
     local llama_args=()
     [[ -n "${model_file}" ]]  && llama_args+=(--model-file "${model_file}")
     [[ -n "${model_alias}" ]] && llama_args+=(--alias "${model_alias}")
-    cmd_start_llama "${llama_args[@]}"
+    cmd_start_llama "${llama_args[@]+"${llama_args[@]}"}"
 
     log_section "Deploy Complete"
     log_ok "RPC server : ${DGX_HOST}:${DGX_RPC_PORT}"
