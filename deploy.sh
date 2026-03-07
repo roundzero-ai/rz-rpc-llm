@@ -269,16 +269,18 @@ cmd_download() {
         python3 -m venv "${venv_dir}"
     fi
 
+    local py="${venv_dir}/bin/python3"
+    local hf_cli="${venv_dir}/bin/huggingface-cli"
     log "Installing/upgrading huggingface_hub..."
-    "${venv_dir}/bin/pip" install -q -U "huggingface_hub[cli]"
+    "${py}" -m pip install -q -U "huggingface_hub[cli]"
 
     log "Downloading (this may take a while)..."
     if [[ -n "${token}" ]]; then
-        HF_TOKEN="${token}" "${venv_dir}/bin/huggingface-cli" download "${repo}" \
+        HF_TOKEN="${token}" "${hf_cli}" download "${repo}" \
             --local-dir "${local_dir}" \
             --include "${pattern}"
     else
-        "${venv_dir}/bin/huggingface-cli" download "${repo}" \
+        "${hf_cli}" download "${repo}" \
             --local-dir "${local_dir}" \
             --include "${pattern}"
     fi
