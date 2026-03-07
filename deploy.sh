@@ -594,8 +594,9 @@ cmd_deploy() {
 cmd_monitor() {
     load_config 2>/dev/null || true
     local interval="${1:-30}"
+    local table_w="${2:-180}"
+    local col_w=10
     local lbl_w=18
-    local min_col_w=10
 
     log_section "Heartbeat Monitor"
     log "Rolling table every ${interval}s — press Ctrl+C to stop all servers"
@@ -710,40 +711,32 @@ cmd_monitor() {
         h0+=("${v0}"); h1+=("${v1}"); h2+=("${v2}"); h3+=("${v3}"); h4+=("${v4}")
         h5+=("${v5}"); h6+=("${v6}"); h7+=("${v7}"); h8+=("${v8}"); h9+=("${v9}"); h10+=("${v10}")
 
-        # -- Calculate rolling window (fill terminal width) --
-        local tw col_w mc total start
-        tw="$(tput cols 2>/dev/null || echo 120)"
+        # -- Calculate rolling window --
+        # Each column: 1 border (│) + col_w data chars = col_w+1
+        local mc total start
         total=${#h_ts[@]}
-        # Determine how many columns we can show (at minimum col width)
-        mc=$(( (tw - lbl_w - 1) / (min_col_w + 3) ))
+        mc=$(( (table_w - lbl_w) / (col_w + 1) ))
         (( mc < 1 )) && mc=1
-        # Cap to available data
-        local visible=$(( total < mc ? total : mc ))
-        (( visible < 1 )) && visible=1
-        # Expand column width to fill the terminal
-        col_w=$(( (tw - lbl_w - 1) / visible - 3 ))
-        (( col_w < min_col_w )) && col_w=${min_col_w}
         start=0
-        (( total > visible )) && start=$(( total - visible ))
+        (( total > mc )) && start=$(( total - mc ))
 
         # -- Draw table (cursor up to overwrite previous) --
         printf "\033[${table_h}A"
 
         # Header row (timestamps)
+        local col_sep; col_sep="$(printf '%*s' "${col_w}" '' | tr ' ' '─')"
         printf "\033[2K${BOLD}%-${lbl_w}s${RESET}" ""
         for (( i = start; i < total; i++ )); do
-            printf " │ ${CYAN}%-${col_w}s${RESET}" "${h_ts[$i]}"
+            printf "│${CYAN}%${col_w}s${RESET}" "${h_ts[$i]}"
         done
-        printf "\n"
+        printf "│\n"
 
         # Separator
-        local sep
-        sep="$(printf '%*s' "${lbl_w}" '' | tr ' ' '─')"
-        printf "\033[2K%s" "${sep}"
+        printf "\033[2K%s" "$(printf '%*s' "${lbl_w}" '' | tr ' ' '─')"
         for (( i = start; i < total; i++ )); do
-            printf "─┼─%s" "$(printf '%*s' "${col_w}" '' | tr ' ' '─')"
+            printf "┼%s" "${col_sep}"
         done
-        printf "\n"
+        printf "┤\n"
 
         # Data rows
         local r val color
@@ -754,17 +747,17 @@ cmd_monitor() {
                 color="${RESET}"
                 [[ "${val}" == "UP" ]]   && color="${GREEN}"
                 [[ "${val}" == "DOWN" ]] && color="${RED}"
-                printf " │ ${color}%${col_w}s${RESET}" "${val}"
+                printf "│${color}%${col_w}s${RESET}" "${val}"
             done
-            printf "\n"
+            printf "│\n"
         done
 
         # Bottom border
-        printf "\033[2K%s" "${sep}"
+        printf "\033[2K%s" "$(printf '%*s' "${lbl_w}" '' | tr ' ' '─')"
         for (( i = start; i < total; i++ )); do
-            printf "─┴─%s" "$(printf '%*s' "${col_w}" '' | tr ' ' '─')"
+            printf "┴%s" "${col_sep}"
         done
-        printf "\n"
+        printf "┘\n"
 
         sleep "${interval}"
     done
@@ -877,8 +870,8 @@ ${BOLD}COMMANDS${RESET}
                  [--skip-clone] [--skip-build] [--skip-download]
       Full pipeline: clone → build-dgx → build-mac → download → start-rpc → start-llama
 
-  ${CYAN}monitor${RESET}  [INTERVAL_SEC]
-      Heartbeat loop — prints health of both servers every N seconds (default 30)
+  ${CYAN}monitor${RESET}  [INTERVAL_SEC] [TABLE_WIDTH]
+      Heartbeat rolling table — default 30s interval, 180-char table width
       Ctrl+C gracefully stops all servers
 
   ${CYAN}status${RESET}
