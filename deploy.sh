@@ -712,7 +712,7 @@ cmd_monitor() {
                 local prompt_tps="" gen_tps="" reqs="" tokens_gen="" tokens_prompt=""
 
                 prompt_tps="$(echo "${metrics}" | awk '/^llamacpp:prompt_tokens_seconds[{ ]/{print $NF; exit}')"
-                gen_tps="$(echo "${metrics}" | awk '/^llamacpp:tokens_seconds[{ ]/{print $NF; exit}')"
+                gen_tps="$(echo "${metrics}" | awk '/^llamacpp:predicted_tokens_seconds[{ ]/{print $NF; exit}')"
                 reqs="$(echo "${metrics}" | awk '/^llamacpp:requests_processing[{ ]/{print $NF; exit}')"
                 tokens_prompt="$(echo "${metrics}" | awk '/^llamacpp:prompt_tokens_total[{ ]/{print $NF; exit}')"
                 tokens_gen="$(echo "${metrics}" | awk '/^llamacpp:tokens_predicted_total[{ ]/{print $NF; exit}')"
