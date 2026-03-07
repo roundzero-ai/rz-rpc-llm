@@ -199,7 +199,8 @@ cmd_build_dgx() {
             -DCMAKE_BUILD_TYPE=Release \
             -DLLAMA_FLASH_ATTENTION=ON \
             && cmake --build build --config Release -j\$(nproc)
-        echo '[DGX] Binaries:' \$(ls build/bin/)
+        echo '[DGX] Executables built:'
+        find build -type f -executable ! -name '*.so' | sort | sed 's/^/  /'
     "
     log_ok "DGX build complete"
 }
@@ -291,8 +292,15 @@ cmd_start_rpc() {
     load_config
     check_dgx_ssh
 
-    local rpc_bin="${DGX_REMOTE_DIR}/build/bin/rpc-server"
     local log_file="/tmp/rpc-server.log"
+
+    # Find rpc-server binary dynamically — location varies by llama.cpp version
+    local rpc_bin
+    rpc_bin="$(ssh_dgx "find '${DGX_REMOTE_DIR}/build' -type f -executable -name 'rpc-server' 2>/dev/null | head -1")"
+    if [[ -z "${rpc_bin}" ]]; then
+        die "rpc-server binary not found anywhere under ${DGX_REMOTE_DIR}/build. Run: ./deploy.sh build-dgx"
+    fi
+    log "rpc-server binary: ${rpc_bin}"
 
     log "Checking for existing rpc-server on DGX..."
     if ssh_dgx "pgrep -x rpc-server" &>/dev/null; then
@@ -304,11 +312,6 @@ cmd_start_rpc() {
     log "Starting rpc-server on DGX (${DGX_HOST}:${DGX_RPC_PORT})..."
     ssh_dgx "
         set -euo pipefail
-        if [[ ! -x '${rpc_bin}' ]]; then
-            echo 'ERROR: rpc-server binary not found at ${rpc_bin}' >&2
-            echo 'Run: ./deploy.sh build-dgx' >&2
-            exit 1
-        fi
         nohup '${rpc_bin}' -H '${DGX_RPC_BIND}' -p '${DGX_RPC_PORT}' \
             > '${log_file}' 2>&1 &
         RPC_PID=\$!
