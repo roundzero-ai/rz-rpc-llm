@@ -593,8 +593,8 @@ cmd_deploy() {
 # ------------------------------------------------------------------------------
 cmd_monitor() {
     load_config 2>/dev/null || true
-    local interval=15
-    local col_w=14
+    local interval="${1:-30}"
+    local min_cols=10
     local lbl_w=18
 
     log_section "Heartbeat Monitor"
@@ -710,9 +710,16 @@ cmd_monitor() {
         h5+=("${v5}"); h6+=("${v6}"); h7+=("${v7}"); h8+=("${v8}"); h9+=("${v9}"); h10+=("${v10}")
 
         # -- Calculate rolling window --
-        local tw mc total start
+        local tw col_w mc total start
         tw="$(tput cols 2>/dev/null || echo 120)"
+        # Start with preferred column width, shrink to fit at least min_cols
+        col_w=14
         mc=$(( (tw - lbl_w - 1) / (col_w + 3) ))
+        if (( mc < min_cols )); then
+            col_w=$(( (tw - lbl_w - 1) / (min_cols + 3) - 3 ))
+            (( col_w < 6 )) && col_w=6
+            mc=$(( (tw - lbl_w - 1) / (col_w + 3) ))
+        fi
         (( mc < 1 )) && mc=1
         total=${#h_ts[@]}
         start=0
