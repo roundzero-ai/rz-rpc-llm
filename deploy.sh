@@ -7,7 +7,7 @@
 #   - Mac Studio M2 Ultra    → llama-server (local + RPC backend)
 #
 # Usage: ./deploy.sh <command> [options]
-#   clone   [--tag TAG]              Clone llama.cpp (default: latest)
+#   clone   [--tag TAG]              Clone llama.cpp (`latest` resolves latest tag)
 #   build-dgx                        Sync source to DGX and build
 #   build-mac                        Build on local Mac
 #   download [--repo R] [--pattern P] [--model-file F] [--alias A]
@@ -16,6 +16,7 @@
 #   start-llama [--model-file F] [--alias A] [--ctx N] [--parallel N]
 #   stop-llama                       Stop local llama-server
 #   deploy  [--tag TAG] [--model-file F] [--alias A]
+#   full    [--tag TAG] [--model-file F] [--alias A]
 #                                    Full pipeline: clone→build→start
 #   status                           Show running processes
 #   logs    [rpc|llama]              Tail logs
@@ -79,6 +80,16 @@ resolve_model_file() {
     fi
 }
 
+resolve_latest_local_tag() {
+    local repo_dir="$1"
+    local latest_tag
+
+    latest_tag="$(git -C "${repo_dir}" tag --sort=version:refname | tail -1)"
+    [[ -n "${latest_tag}" ]] || die "No tags found in ${repo_dir}"
+
+    echo "${latest_tag}"
+}
+
 # ------------------------------------------------------------------------------
 # SSH helpers — ControlMaster so password is entered only once per session
 # ------------------------------------------------------------------------------
@@ -116,6 +127,7 @@ check_dgx_ssh() {
 cmd_clone() {
     local tag=""
     local repo="https://github.com/ggml-org/llama.cpp.git"
+    local resolved_tag=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -127,7 +139,7 @@ cmd_clone() {
 
     log_section "Clone llama.cpp"
     log "Repo : ${repo}"
-    log "Tag  : ${tag:-latest (HEAD)}"
+    log "Tag  : ${tag:-HEAD}"
     log "Dest : ${LLAMA_CPP_DIR}"
 
     if [[ -d "${LLAMA_CPP_DIR}/.git" ]]; then
@@ -145,8 +157,14 @@ cmd_clone() {
     fi
 
     if [[ -n "${tag}" ]]; then
-        log "Checking out tag/commit: ${tag}"
-        git -C "${LLAMA_CPP_DIR}" checkout "${tag}"
+        resolved_tag="${tag}"
+        if [[ "${tag}" == "latest" ]]; then
+            resolved_tag="$(resolve_latest_local_tag "${LLAMA_CPP_DIR}")"
+            log "Resolved latest tag: ${resolved_tag}"
+        fi
+
+        log "Checking out tag/commit: ${resolved_tag}"
+        git -C "${LLAMA_CPP_DIR}" checkout "${resolved_tag}"
         log_ok "Checked out: $(git -C "${LLAMA_CPP_DIR}" describe --always --tags)"
     else
         log_ok "At HEAD: $(git -C "${LLAMA_CPP_DIR}" log -1 --oneline)"
@@ -539,7 +557,7 @@ cmd_deploy() {
     load_config
 
     log_section "Full Deploy Pipeline"
-    log "Tag          : ${tag:-latest}"
+    log "Tag          : ${tag:-HEAD}"
     log "Model file   : ${model_file:-${DEFAULT_MODEL_FILE}}"
     log "Skip clone   : ${skip_clone}"
     log "Skip build   : ${skip_build}"
@@ -841,7 +859,7 @@ ${BOLD}USAGE${RESET}
 
 ${BOLD}COMMANDS${RESET}
   ${CYAN}clone${RESET}    [--tag TAG]
-      Clone llama.cpp (optionally at a specific tag/commit, e.g. b8223)
+       Clone llama.cpp at HEAD, or use --tag TAG / --tag latest
 
   ${CYAN}build-dgx${RESET}
       Rsync source to DGX and build with CUDA (SM121)
@@ -868,7 +886,11 @@ ${BOLD}COMMANDS${RESET}
 
   ${CYAN}deploy${RESET}   [--tag TAG] [--model-file PATH] [--alias NAME]
                  [--skip-clone] [--skip-build] [--skip-download]
-      Full pipeline: clone → build-dgx → build-mac → download → start-rpc → start-llama
+       Full pipeline: clone → build-dgx → build-mac → download → start-rpc → start-llama
+
+  ${CYAN}full${RESET}     [--tag TAG] [--model-file PATH] [--alias NAME]
+                 [--skip-clone] [--skip-build] [--skip-download]
+       Shortcut for ${CYAN}deploy${RESET}
 
   ${CYAN}monitor${RESET}  [INTERVAL_SEC] [TABLE_WIDTH]
       Heartbeat rolling table — default 30s interval, 180-char table width
@@ -883,6 +905,9 @@ ${BOLD}COMMANDS${RESET}
 ${BOLD}EXAMPLES${RESET}
   # First-time full deploy at tag b8223
   ./deploy.sh deploy --tag b8223
+
+  # Deploy using the latest llama.cpp tag
+  ./deploy.sh full --tag latest
 
   # Already built; just restart servers with a different model
   ./deploy.sh start-rpc
@@ -918,7 +943,7 @@ main() {
         stop-rpc)    cmd_stop_rpc "$@" ;;
         start-llama) cmd_start_llama "$@" ;;
         stop-llama)  cmd_stop_llama "$@" ;;
-        deploy)      cmd_deploy "$@" ;;
+        deploy|full) cmd_deploy "$@" ;;
         monitor)     cmd_monitor "$@" ;;
         status)      cmd_status "$@" ;;
         logs)        cmd_logs "$@" ;;
