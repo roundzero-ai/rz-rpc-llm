@@ -234,8 +234,8 @@ gen tokens         │      3.5K │      4.2K │      5.8K │      7.1K │
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLAMA_CTX_SIZE` | `131072` | Context window size |
-| `LLAMA_PARALLEL` | `4` | Parallel request slots |
+| `LLAMA_CTX_SIZE` | `65536` | Context window size |
+| `LLAMA_PARALLEL` | `1` | Parallel request slots |
 | `LLAMA_TENSOR_SPLIT` | `2,3` | Layer split ratio (Mac:DGX) |
 | `LLAMA_SPLIT_MODE` | `layer` | Split mode (`layer` or `row`) |
 | `LLAMA_N_GPU_LAYERS` | `all` | Number of layers to offload to GPU |
@@ -251,11 +251,15 @@ gen tokens         │      3.5K │      4.2K │      5.8K │      7.1K │
 | `LLAMA_REPEAT_PENALTY` | `1.0` | Repetition penalty |
 | `LLAMA_CACHE_TYPE_K` | `q8_0` | KV cache quantization for keys |
 | `LLAMA_CACHE_TYPE_V` | `q8_0` | KV cache quantization for values |
-| `LLAMA_CACHE_REUSE` | `256` | Cache reuse window |
+| `LLAMA_CACHE_PROMPT` | `0` | Enable in-memory prompt cache across requests |
+| `LLAMA_CACHE_RAM` | `0` | Prompt cache RAM cap in MiB (`0` uses llama.cpp default) |
+| `LLAMA_CACHE_REUSE` | `64` | Cache reuse window when prompt cache is enabled |
+| `LLAMA_CONT_BATCHING` | `1` | Enable continuous batching |
+| `LLAMA_NO_CONTEXT_SHIFT` | `0` | Disable context shifting (`1` keeps full history and can slow long chats) |
 
-### Hardcoded llama-server Flags
+### Always-on llama-server Flags
 
-These are always passed and not configurable via `config.env`:
+These are always passed:
 
 | Flag | Description |
 |---|---|
@@ -266,10 +270,37 @@ These are always passed and not configurable via `config.env`:
 | `--kv-offload` | Offload KV cache to GPU |
 | `--kv-unified` | Use unified KV cache across devices |
 | `--flash-attn on` | Enable flash attention |
-| `--cont-batching` | Enable continuous batching |
-| `--no-context-shift` | Disable context shift (use with large context) |
-| `--cache-prompt` | Cache prompt for reuse |
 | `--metrics` | Enable Prometheus `/metrics` endpoint |
+
+### Optional llama-server Flags (`config.env`)
+
+These are controlled by config so you can tune long-running latency without editing the script:
+
+| Config | Enabled when | Flag | Notes |
+|---|---|---|---|
+| `LLAMA_CONT_BATCHING` | `1` | `--cont-batching` | Good for throughput; can be left on for most setups |
+| `LLAMA_NO_CONTEXT_SHIFT` | `1` | `--no-context-shift` | Keeps full history until the slot is full; long chats get slower over time |
+| `LLAMA_CACHE_PROMPT` | `1` | `--cache-prompt` | Reuses prompt state across requests; can retain stale prefixes |
+| `LLAMA_CACHE_PROMPT` + `LLAMA_CACHE_REUSE` | `1` | `--cache-reuse N` | Reuse window for prompt cache |
+| `LLAMA_CACHE_PROMPT` + `LLAMA_CACHE_RAM` | `1` and non-zero | `--cache-ram N` | Caps RAM used by prompt cache |
+
+### Latency Tuning
+
+If the server gets slower over time for single-user chat sessions, the usual causes are long retained context and prompt reuse rather than a classic memory leak. Start with this profile in `config.env`:
+
+```bash
+LLAMA_CTX_SIZE=65536
+LLAMA_PARALLEL=1
+LLAMA_CACHE_PROMPT=0
+LLAMA_NO_CONTEXT_SHIFT=0
+```
+
+Why this helps:
+
+- `LLAMA_NO_CONTEXT_SHIFT=0` allows older tokens to slide out instead of keeping ever-growing history in each slot.
+- `LLAMA_CACHE_PROMPT=0` stops the server from holding large prompt prefixes in RAM for reuse.
+- `LLAMA_PARALLEL=1` avoids reserving extra long-context slots when you only serve one request at a time.
+- `LLAMA_CTX_SIZE=65536` cuts KV pressure roughly in half versus `131072` while still leaving a large window.
 
 ---
 

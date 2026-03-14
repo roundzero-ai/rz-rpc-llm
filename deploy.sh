@@ -63,6 +63,12 @@ load_config() {
         MODELS_DIR="${SCRIPT_DIR}/${MODELS_DIR#./}"
     fi
 
+    # Backward-compatible defaults for newer tuning flags
+    LLAMA_CACHE_PROMPT="${LLAMA_CACHE_PROMPT:-0}"
+    LLAMA_CACHE_RAM="${LLAMA_CACHE_RAM:-0}"
+    LLAMA_CONT_BATCHING="${LLAMA_CONT_BATCHING:-1}"
+    LLAMA_NO_CONTEXT_SHIFT="${LLAMA_NO_CONTEXT_SHIFT:-0}"
+
     # Allow HF_TOKEN override from environment
     HF_TOKEN="${HF_TOKEN:-}"
     if [[ -n "${HF_TOKEN_ENV:-}" ]]; then
@@ -435,41 +441,56 @@ cmd_start_llama() {
     fi
 
     log "Launching llama-server..."
+    local -a llama_flags=(
+        --model            "${resolved_model}"
+        --alias            "${model_alias}"
+        --jinja
+        --reasoning-format auto
+        --temp             "${LLAMA_TEMP}"
+        --top-p            "${LLAMA_TOP_P}"
+        --top-k            "${LLAMA_TOP_K}"
+        --min-p            "${LLAMA_MIN_P}"
+        --repeat-penalty   "${LLAMA_REPEAT_PENALTY}"
+        --ctx-size         "${ctx_size}"
+        --host             "${LLAMA_HOST}"
+        --port             "${LLAMA_PORT}"
+        --prio             "${LLAMA_PRIO}"
+        --parallel         "${parallel}"
+        --rpc              "${DGX_HOST}:${DGX_RPC_PORT}"
+        --split-mode       "${LLAMA_SPLIT_MODE}"
+        --tensor-split     "${LLAMA_TENSOR_SPLIT}"
+        --threads          "${LLAMA_THREADS}"
+        --threads-batch    "${LLAMA_THREADS_BATCH}"
+        --batch-size       "${LLAMA_BATCH_SIZE}"
+        --ubatch-size      "${LLAMA_UBATCH_SIZE}"
+        --n-gpu-layers     "${LLAMA_N_GPU_LAYERS}"
+        --no-mmap
+        --mlock
+        --kv-offload
+        --kv-unified
+        --flash-attn       on
+        --cache-type-k     "${LLAMA_CACHE_TYPE_K}"
+        --cache-type-v     "${LLAMA_CACHE_TYPE_V}"
+        --metrics
+    )
+
+    if [[ "${LLAMA_CONT_BATCHING}" == "1" ]]; then
+        llama_flags+=(--cont-batching)
+    fi
+
+    if [[ "${LLAMA_NO_CONTEXT_SHIFT}" == "1" ]]; then
+        llama_flags+=(--no-context-shift)
+    fi
+
+    if [[ "${LLAMA_CACHE_PROMPT}" == "1" ]]; then
+        llama_flags+=(--cache-prompt --cache-reuse "${LLAMA_CACHE_REUSE}")
+        if [[ "${LLAMA_CACHE_RAM}" != "0" ]]; then
+            llama_flags+=(--cache-ram "${LLAMA_CACHE_RAM}")
+        fi
+    fi
+
     nohup "${llama_bin}" \
-        --model            "${resolved_model}" \
-        --alias            "${model_alias}" \
-        --jinja \
-        --reasoning-format auto \
-        --temp             "${LLAMA_TEMP}" \
-        --top-p            "${LLAMA_TOP_P}" \
-        --top-k            "${LLAMA_TOP_K}" \
-        --min-p            "${LLAMA_MIN_P}" \
-        --repeat-penalty   "${LLAMA_REPEAT_PENALTY}" \
-        --ctx-size         "${ctx_size}" \
-        --host             "${LLAMA_HOST}" \
-        --port             "${LLAMA_PORT}" \
-        --prio             "${LLAMA_PRIO}" \
-        --parallel         "${parallel}" \
-        --rpc              "${DGX_HOST}:${DGX_RPC_PORT}" \
-        --split-mode       "${LLAMA_SPLIT_MODE}" \
-        --tensor-split     "${LLAMA_TENSOR_SPLIT}" \
-        --threads          "${LLAMA_THREADS}" \
-        --threads-batch    "${LLAMA_THREADS_BATCH}" \
-        --batch-size       "${LLAMA_BATCH_SIZE}" \
-        --ubatch-size      "${LLAMA_UBATCH_SIZE}" \
-        --n-gpu-layers     "${LLAMA_N_GPU_LAYERS}" \
-        --no-mmap \
-        --mlock \
-        --kv-offload \
-        --kv-unified \
-        --flash-attn       on \
-        --cont-batching \
-        --no-context-shift \
-        --cache-type-k     "${LLAMA_CACHE_TYPE_K}" \
-        --cache-type-v     "${LLAMA_CACHE_TYPE_V}" \
-        --cache-prompt \
-        --cache-reuse      "${LLAMA_CACHE_REUSE}" \
-        --metrics \
+        "${llama_flags[@]}" \
         > "${log_file}" 2>&1 &
     local llama_pid=$!
     echo "${llama_pid}" > "${pid_file}"
