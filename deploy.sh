@@ -90,7 +90,10 @@ resolve_latest_local_tag() {
     local repo_dir="$1"
     local latest_tag
 
-    latest_tag="$(git -C "${repo_dir}" tag --sort=version:refname | tail -1)"
+    latest_tag="$(git -C "${repo_dir}" tag --sort=version:refname | grep '^b[0-9]' | tail -1)"
+    if [[ -z "${latest_tag}" ]]; then
+        latest_tag="$(git -C "${repo_dir}" tag --sort=version:refname | tail -1)"
+    fi
     [[ -n "${latest_tag}" ]] || die "No tags found in ${repo_dir}"
 
     echo "${latest_tag}"
@@ -166,7 +169,7 @@ cmd_clone() {
         resolved_tag="${tag}"
         if [[ "${tag}" == "latest" ]]; then
             resolved_tag="$(resolve_latest_local_tag "${LLAMA_CPP_DIR}")"
-            log "Resolved latest tag: ${resolved_tag}"
+            log "Resolved latest RPC-compatible tag: ${resolved_tag}"
         fi
 
         log "Checking out tag/commit: ${resolved_tag}"
@@ -209,6 +212,7 @@ cmd_build_dgx() {
     ssh_dgx bash -l << ENDSSH
 set -euo pipefail
 cd '${DGX_REMOTE_DIR}'
+rm -rf build
 echo "[DGX] PATH: \$PATH"
 echo "[DGX] cmake: \$(which cmake 2>/dev/null || echo NOT FOUND)"
 echo "[DGX] nvcc:  \$(which nvcc  2>/dev/null || echo NOT FOUND)"
@@ -221,8 +225,9 @@ cmake -B build \
     -DBUILD_SHARED_LIBS=OFF \
     -DGGML_RPC=ON \
     -DCMAKE_BUILD_TYPE=Release \
-    -DLLAMA_FLASH_ATTENTION=ON \
-    && cmake --build build --config Release -j\$(nproc)
+    -DLLAMA_FLASH_ATTENTION=ON
+echo "[DGX] building rpc-server target..."
+cmake --build build --config Release -j\$(nproc) --target rpc-server
 echo "[DGX] Executables built:"
 find build -type f -executable ! -name '*.so' | sort | sed 's/^/  /'
 ENDSSH
@@ -239,6 +244,7 @@ cmd_build_mac() {
     [[ -d "${LLAMA_CPP_DIR}/.git" ]] || die "llama.cpp not cloned. Run: ./deploy.sh clone"
 
     cd "${LLAMA_CPP_DIR}"
+    rm -rf build
     log "cmake configure (Metal, RPC)..."
     cmake -B build \
         -DGGML_METAL=ON \
@@ -250,7 +256,7 @@ cmd_build_mac() {
     local jobs
     jobs=$(sysctl -n hw.logicalcpu 2>/dev/null || nproc)
     log "cmake build (${jobs} jobs)..."
-    cmake --build build --config Release -j"${jobs}"
+    cmake --build build --config Release -j"${jobs}" --target llama-server
 
     log_ok "Mac build complete. Binaries: $(ls "${LLAMA_CPP_DIR}/build/bin/")"
 }
@@ -598,6 +604,10 @@ cmd_deploy() {
     if (( ! skip_download )); then
         cmd_download
     fi
+
+    log "Stopping existing servers so new build and config take effect..."
+    cmd_stop_llama || true
+    cmd_stop_rpc || true
 
     # Start RPC first, then llama-server
     cmd_start_rpc
