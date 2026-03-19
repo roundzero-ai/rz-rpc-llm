@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# rz-rpc-llm — LLaMA.cpp RPC Deployment
+# rz-rpc-llm — LLaMA.cpp Deployment
 #
-# Splits inference across two devices:
-#   - DGX Spark GB10 (CUDA)  → rpc-server
-#   - Mac Studio M2 Ultra    → llama-server (local + RPC backend)
+# Two modes:
+#   - Distributed:  DGX Spark GB10 (CUDA)  → rpc-server  +  Mac Studio (Metal)
+#   - Vision:      Mac Studio alone with --vision flag (Qwen3.5 + mmproj)
 #
 # Usage: ./deploy.sh <command> [options]
 #   clone   [--tag TAG]              Clone llama.cpp (`latest` resolves latest tag)
 #   build-dgx                        Sync source to DGX and build
 #   build-mac                        Build on local Mac
-#   download [--repo R] [--pattern P] [--model-file F] [--alias A]
+#   download [--repo R] [--pattern P] [--dir D] [--vision]
 #   start-rpc                        Start rpc-server on DGX
 #   stop-rpc                         Stop rpc-server on DGX
-#   start-llama [--model-file F] [--alias A] [--ctx N] [--parallel N]
+#   start-llama [--model-file F] [--alias A] [--ctx N] [--parallel N] [--vision]
 #   stop-llama                       Stop local llama-server
 #   deploy  [--tag TAG] [--model-file F] [--alias A]
 #   full    [--tag TAG] [--model-file F] [--alias A]
@@ -250,8 +250,7 @@ cmd_build_mac() {
         -DGGML_METAL=ON \
         -DBUILD_SHARED_LIBS=OFF \
         -DGGML_RPC=ON \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DLLAMA_FLASH_ATTENTION=ON
+        -DCMAKE_BUILD_TYPE=Release
 
     local jobs
     jobs=$(sysctl -n hw.logicalcpu 2>/dev/null || nproc)
@@ -268,17 +267,56 @@ cmd_download() {
     local repo=""
     local pattern=""
     local local_dir=""
+    local mmproj_pattern=""
+    local vision_mode=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --repo)        repo="$2";       shift 2 ;;
             --pattern|-p)  pattern="$2";    shift 2 ;;
-            --dir)         local_dir="$2";  shift 2 ;;
+            --dir)         local_dir="$2";   shift 2 ;;
+            --vision|-v)   vision_mode="1";  shift ;;
             *) die "Unknown option: $1" ;;
         esac
     done
 
     load_config
+    local token="${HF_TOKEN:-}"
+    [[ -z "${token}" ]] && log_warn "HF_TOKEN not set — download may fail for gated models"
+
+    mkdir -p "${MODELS_DIR}"
+
+    if [[ -n "${vision_mode}" ]]; then
+        repo="${repo:-${DEFAULT_VISION_REPO:-unsloth/Qwen3.5-122B-A10B-GGUF}}"
+        pattern="${pattern:-${DEFAULT_MODEL_PATTERN}}"
+        mmproj_pattern="${DEFAULT_MM_PROJ_PATTERN:-mmproj*.gguf}"
+        local_dir="${local_dir:-${MODELS_DIR}}"
+
+        log_section "Download Vision Model"
+        log "HF repo  : ${repo}"
+        log "Pattern  : ${pattern} + ${mmproj_pattern}"
+        log "Local dir: ${local_dir}"
+
+        if ! command -v huggingface-cli &>/dev/null; then
+            die "huggingface-cli not found. Install it with: pip install huggingface_hub"
+        fi
+        log "Downloading model + mmproj (this may take a while)..."
+        if [[ -n "${token}" ]]; then
+            HF_TOKEN="${token}" huggingface-cli download "${repo}" \
+                --local-dir "${local_dir}" \
+                --include "${pattern}" "${mmproj_pattern}"
+        else
+            huggingface-cli download "${repo}" \
+                --local-dir "${local_dir}" \
+                --include "${pattern}" "${mmproj_pattern}"
+        fi
+
+        log_ok "Download complete → ${local_dir}"
+        log "GGUF files:"
+        find "${local_dir}" -name "*.gguf" | sort | sed 's/^/  /'
+        return 0
+    fi
+
     repo="${repo:-${DEFAULT_MODEL_REPO}}"
     pattern="${pattern:-${DEFAULT_MODEL_PATTERN}}"
     local_dir="${local_dir:-${MODELS_DIR}}"
@@ -287,11 +325,6 @@ cmd_download() {
     log "HF repo  : ${repo}"
     log "Pattern  : ${pattern}"
     log "Local dir: ${local_dir}"
-
-    local token="${HF_TOKEN:-}"
-    [[ -z "${token}" ]] && log_warn "HF_TOKEN not set — download may fail for gated models"
-
-    mkdir -p "${local_dir}"
 
     if ! command -v huggingface-cli &>/dev/null; then
         die "huggingface-cli not found. Install it with: pip install huggingface_hub"
@@ -397,6 +430,7 @@ cmd_start_llama() {
     local model_alias=""
     local ctx_size=""
     local parallel=""
+    local vision_mode=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -404,26 +438,43 @@ cmd_start_llama() {
             --alias|-a)      model_alias="$2"; shift 2 ;;
             --ctx|-c)        ctx_size="$2";    shift 2 ;;
             --parallel|-p)   parallel="$2";    shift 2 ;;
+            --vision|-v)     vision_mode="1"; shift ;;
             *) die "Unknown option: $1" ;;
         esac
     done
 
     load_config
-    model_file="${model_file:-${DEFAULT_MODEL_FILE}}"
-    model_alias="${model_alias:-${DEFAULT_MODEL_ALIAS}}"
-    ctx_size="${ctx_size:-${LLAMA_CTX_SIZE}}"
-    parallel="${parallel:-${LLAMA_PARALLEL}}"
 
-    local resolved_model
+    if [[ -n "${vision_mode}" ]]; then
+        model_file="${model_file:-${DEFAULT_VISION_MODEL_FILE}}"
+        model_alias="${model_alias:-${DEFAULT_VISION_ALIAS}}"
+    else
+        model_file="${model_file:-${DEFAULT_MODEL_FILE}}"
+        model_alias="${model_alias:-${DEFAULT_MODEL_ALIAS}}"
+    fi
+
+    local resolved_model resolved_mmproj
     resolved_model="$(resolve_model_file "${model_file}")"
+    resolved_mmproj=""
+    if [[ -n "${vision_mode}" ]]; then
+        resolved_mmproj="$(resolve_model_file "${DEFAULT_VISION_MM_PROJ}")"
+    fi
 
     log_section "Start llama-server on Mac Studio"
     log "Model file : ${resolved_model}"
     log "Model alias: ${model_alias}"
-    log "Context    : ${ctx_size}"
-    log "Parallel   : ${parallel}"
-    log "RPC backend: ${DGX_HOST}:${DGX_RPC_PORT}"
     log "Listening  : ${LLAMA_HOST}:${LLAMA_PORT}"
+
+    if [[ -n "${vision_mode}" ]]; then
+        log "Mode       : ${GREEN}VISION (multimodal)${RESET}"
+        log "MM proj    : ${resolved_mmproj}"
+        log "Context    : ${LLAMA_VISION_CTX_SIZE:-${LLAMA_CTX_SIZE}}"
+        log "Parallel   : ${LLAMA_VISION_PARALLEL:-1}"
+    else
+        log "Mode       : text-only (RPC: ${DGX_HOST}:${DGX_RPC_PORT})"
+        log "Context    : ${ctx_size:-${LLAMA_CTX_SIZE}}"
+        log "Parallel   : ${parallel:-${LLAMA_PARALLEL}}"
+    fi
 
     local llama_bin="${LLAMA_CPP_DIR}/build/bin/llama-server"
     [[ -x "${llama_bin}" ]] || die "llama-server not found at ${llama_bin}. Run: ./deploy.sh build-mac"
@@ -446,6 +497,18 @@ cmd_start_llama() {
         fi
     fi
 
+    if [[ -n "${vision_mode}" ]] && [[ ! -f "${resolved_mmproj}" ]]; then
+        die "MM proj file not found: ${resolved_mmproj}. Download with: ./deploy.sh download --vision"
+    fi
+
+    local vision_ctx="${LLAMA_VISION_CTX_SIZE:-${LLAMA_CTX_SIZE}}"
+    local vision_parallel="${LLAMA_VISION_PARALLEL:-1}"
+    local vision_batch="${LLAMA_VISION_BATCH_SIZE:-${LLAMA_BATCH_SIZE}}"
+    local vision_ubatch="${LLAMA_VISION_UBATCH_SIZE:-${LLAMA_UBATCH_SIZE}}"
+    local vision_gpu_layers="${LLAMA_VISION_N_GPU_LAYERS:-${LLAMA_N_GPU_LAYERS}}"
+    local vision_ctk="${LLAMA_VISION_CACHE_TYPE_K:-${LLAMA_CACHE_TYPE_K}}"
+    local vision_ctv="${LLAMA_VISION_CACHE_TYPE_V:-${LLAMA_CACHE_TYPE_V}}"
+
     log "Launching llama-server..."
     local -a llama_flags=(
         --model            "${resolved_model}"
@@ -457,28 +520,40 @@ cmd_start_llama() {
         --top-k            "${LLAMA_TOP_K}"
         --min-p            "${LLAMA_MIN_P}"
         --repeat-penalty   "${LLAMA_REPEAT_PENALTY}"
-        --ctx-size         "${ctx_size}"
+        --presence-penalty "${LLAMA_PRESENCE_PENALTY}"
+        --ctx-size         "${vision_ctx}"
         --host             "${LLAMA_HOST}"
         --port             "${LLAMA_PORT}"
         --prio             "${LLAMA_PRIO}"
-        --parallel         "${parallel}"
-        --rpc              "${DGX_HOST}:${DGX_RPC_PORT}"
-        --split-mode       "${LLAMA_SPLIT_MODE}"
-        --tensor-split     "${LLAMA_TENSOR_SPLIT}"
+        --parallel         "${vision_parallel}"
         --threads          "${LLAMA_THREADS}"
         --threads-batch    "${LLAMA_THREADS_BATCH}"
-        --batch-size       "${LLAMA_BATCH_SIZE}"
-        --ubatch-size      "${LLAMA_UBATCH_SIZE}"
-        --n-gpu-layers     "${LLAMA_N_GPU_LAYERS}"
-        --no-mmap
+        --batch-size       "${vision_batch}"
+        --ubatch-size      "${vision_ubatch}"
+        --n-gpu-layers     "${vision_gpu_layers}"
+        --mmap
         --mlock
         --kv-offload
         --kv-unified
-        --flash-attn       on
-        --cache-type-k     "${LLAMA_CACHE_TYPE_K}"
-        --cache-type-v     "${LLAMA_CACHE_TYPE_V}"
+        --flash-attn       "${LLAMA_FLASH_ATTN}"
+        --cache-type-k     "${vision_ctk}"
+        --cache-type-v     "${vision_ctv}"
+        --perf
         --metrics
     )
+
+    if [[ -n "${vision_mode}" ]]; then
+        llama_flags+=(
+            --mmproj     "${resolved_mmproj}"
+            --split-mode none
+        )
+    else
+        llama_flags+=(
+            --rpc            "${DGX_HOST}:${DGX_RPC_PORT}"
+            --split-mode     "${LLAMA_SPLIT_MODE}"
+            --tensor-split   "${LLAMA_TENSOR_SPLIT}"
+        )
+    fi
 
     if [[ "${LLAMA_CONT_BATCHING}" == "1" ]]; then
         llama_flags+=(--cont-batching)
@@ -883,7 +958,7 @@ cmd_logs() {
 # ------------------------------------------------------------------------------
 usage() {
     cat <<EOF
-${BOLD}rz-rpc-llm${RESET} — LLaMA.cpp RPC deployment across DGX Spark + Mac Studio
+${BOLD}rz-rpc-llm${RESET} — LLaMA.cpp deployment (distributed text or vision)
 
 ${BOLD}USAGE${RESET}
   ./deploy.sh <command> [options]
@@ -893,27 +968,28 @@ ${BOLD}COMMANDS${RESET}
        Clone llama.cpp at HEAD, or use --tag TAG / --tag latest
 
   ${CYAN}build-dgx${RESET}
-      Rsync source to DGX and build with CUDA (SM121)
+       Rsync source to DGX and build with CUDA (SM121)
 
   ${CYAN}build-mac${RESET}
-      Build locally on Mac with Metal
+       Build locally on Mac with Metal
 
-  ${CYAN}download${RESET} [--repo REPO] [--pattern GLOB] [--dir DIR]
-      Download model from HuggingFace
-      Defaults from config.env: ${BOLD}DEFAULT_MODEL_REPO, DEFAULT_MODEL_PATTERN${RESET}
+  ${CYAN}download${RESET} [--repo REPO] [--pattern GLOB] [--dir DIR] [--vision]
+       Download model from HuggingFace
+       ${GREEN}--vision${RESET} downloads Qwen3.5-122B model + mmproj for multimodal
 
   ${CYAN}start-rpc${RESET}
-      Start rpc-server on DGX (must come before start-llama)
+       Start rpc-server on DGX (for distributed text inference)
 
   ${CYAN}stop-rpc${RESET}
-      Stop rpc-server on DGX
+       Stop rpc-server on DGX
 
-  ${CYAN}start-llama${RESET} [--model-file PATH] [--alias NAME] [--ctx N] [--parallel N]
-      Start llama-server locally (uses RPC backend on DGX)
-      PATH is relative to MODELS_DIR or absolute
+  ${CYAN}start-llama${RESET} [--model-file PATH] [--alias NAME] [--ctx N] [--parallel N] [--vision]
+       Start llama-server locally
+       ${GREEN}--vision${RESET} uses vision defaults (no RPC, includes --mmproj)
+       PATH is relative to MODELS_DIR or absolute
 
   ${CYAN}stop-llama${RESET}
-      Stop local llama-server
+       Stop local llama-server
 
   ${CYAN}deploy${RESET}   [--tag TAG] [--model-file PATH] [--alias NAME]
                  [--skip-clone] [--skip-build] [--skip-download]
@@ -924,30 +1000,28 @@ ${BOLD}COMMANDS${RESET}
        Shortcut for ${CYAN}deploy${RESET}
 
   ${CYAN}monitor${RESET}  [INTERVAL_SEC] [TABLE_WIDTH]
-      Heartbeat rolling table — default 30s interval, 180-char table width
-      Ctrl+C gracefully stops all servers
+       Heartbeat rolling table — default 30s interval, 180-char table width
+       Ctrl+C gracefully stops all servers
 
   ${CYAN}status${RESET}
-      Show running process status for both devices
+       Show running process status for both devices
 
   ${CYAN}logs${RESET}     [llama|rpc]
-      Tail logs (default: llama)
+       Tail logs (default: llama)
 
 ${BOLD}EXAMPLES${RESET}
-  # First-time full deploy at tag b8223
+  ${BOLD}# Distributed text inference (Mac + DGX):${RESET}
   ./deploy.sh deploy --tag b8223
 
-  # Deploy using the latest llama.cpp tag
-  ./deploy.sh full --tag latest
+  ${BOLD}# Vision model (Mac solo, no DGX needed):${RESET}
+  ./deploy.sh download --vision
+  ./deploy.sh start-llama --vision
 
-  # Already built; just restart servers with a different model
-  ./deploy.sh start-rpc
-  ./deploy.sh start-llama --model-file "UD-Q4_K_M/model-00001.gguf" --alias "minimax-q4"
+  # Restart vision model
+  ./deploy.sh stop-llama
+  ./deploy.sh start-llama --vision
 
-  # Download a different quantization
-  ./deploy.sh download --pattern "*UD-Q4_K_M*"
-
-  # Check health
+  ${BOLD}# Check health${RESET}
   ./deploy.sh status
   curl http://localhost:${LLAMA_PORT:-8680}/health
 
