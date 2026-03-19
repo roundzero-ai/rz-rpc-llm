@@ -431,6 +431,7 @@ cmd_start_llama() {
     local ctx_size=""
     local parallel=""
     local vision_mode=""
+    local monitor_mode=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -439,9 +440,13 @@ cmd_start_llama() {
             --ctx|-c)        ctx_size="$2";    shift 2 ;;
             --parallel|-p)   parallel="$2";    shift 2 ;;
             --vision|-v)     vision_mode="1"; shift ;;
+            --monitor)       monitor_mode="1"; shift ;;
             *) die "Unknown option: $1" ;;
         esac
     done
+
+    # Vision mode auto-enables monitor
+    [[ -n "${vision_mode}" ]] && monitor_mode="1"
 
     load_config
 
@@ -587,6 +592,10 @@ cmd_start_llama() {
             log_ok "OpenAI-compatible endpoint: http://127.0.0.1:${LLAMA_PORT}/v1"
             log_ok "Metrics: http://127.0.0.1:${LLAMA_PORT}/metrics"
             log "Log: ${log_file}"
+            if [[ -n "${monitor_mode}" ]]; then
+                echo
+                cmd_monitor
+            fi
             return 0
         fi
         if ! kill -0 "${llama_pid}" 2>/dev/null; then
@@ -713,36 +722,66 @@ cmd_deploy() {
 }
 
 # ------------------------------------------------------------------------------
-# Command: monitor  — heartbeat loop, Ctrl+C to stop all servers
+# Command: monitor  — heartbeat loop, Ctrl+C to stop llama-server
 # ------------------------------------------------------------------------------
 cmd_monitor() {
     load_config 2>/dev/null || true
     local interval="${1:-30}"
     local table_w="${2:-180}"
-    local col_w=10
-    local lbl_w=18
+    local col_w=12
+    local lbl_w=20
 
-    log_section "Heartbeat Monitor"
-    log "Rolling table every ${interval}s — press Ctrl+C to stop all servers"
+    local monitor_mode=""
+    if ! ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+            "${DGX_USER}@${DGX_HOST}" &>/dev/null 2>&1; then
+        monitor_mode="VISION"
+    else
+        monitor_mode="DISTRIBUTED"
+    fi
+
+    log_section "Heartbeat Monitor [${monitor_mode}]"
+    log "Rolling table every ${interval}s — press Ctrl+C to stop llama-server"
     echo
 
     trap '
         echo
         tput cnorm 2>/dev/null || true
-        log_warn "Ctrl+C received — stopping servers..."
+        log_warn "Ctrl+C received — stopping llama-server..."
         cmd_stop_llama 2>/dev/null || true
-        cmd_stop_rpc   2>/dev/null || true
-        log_ok "Servers stopped. Goodbye."
+        log_ok "llama-server stopped. Goodbye."
         exit 0
     ' INT TERM
 
-    local -a labels=("Mac memory" "Mac GPU" "DGX memory" "DGX GPU" "rpc-server" "llama-server" "pp (t/s)" "tg (t/s)" "reqs processing" "prompt tokens" "gen tokens")
-    local n_rows=${#labels[@]}
-    local table_h=$(( n_rows + 3 ))  # header + separator + rows + bottom
+    local -a labels_vision=(
+        "Mac RAM used" "Mac GPU util"
+        "llama-server" "pp (t/s)" "tg (t/s)"
+        "reqs" "prompt tokens" "gen tokens"
+    )
+    local -a labels_distributed=(
+        "Mac RAM used" "Mac GPU util"
+        "DGX RAM used" "DGX GPU util"
+        "rpc-server" "llama-server"
+        "pp (t/s)" "tg (t/s)"
+        "reqs" "prompt tokens" "gen tokens"
+    )
 
-    # History arrays: h_ts for timestamps, h0..h10 for each row
+    local -a labels
+    local -a row_hist  # maps row r → history array variable name (h0..h10)
+    local n_rows
+    if [[ "${monitor_mode}" == "VISION" ]]; then
+        labels=("${labels_vision[@]}")
+        row_hist=(h0 h1 h5 h6 h7 h8 h9 h10)
+        n_rows=8
+    else
+        labels=("${labels_distributed[@]}")
+        row_hist=(h0 h1 h2 h3 h4 h5 h6 h7 h8 h9 h10)
+        n_rows=11
+    fi
+    local table_h=$(( n_rows + 3 ))
+
+    # History arrays
     local -a h_ts=()
-    local -a h0=() h1=() h2=() h3=() h4=() h5=() h6=() h7=() h8=() h9=() h10=()
+    declare -a h0=() h1=() h2=() h3=() h4=() h5=() h6=() h7=() h8=() h9=() h10=()
 
     # Reserve vertical space for the table
     local i
@@ -753,7 +792,7 @@ cmd_monitor() {
     while true; do
         local ts; ts="$(date '+%H:%M:%S')"
 
-        # -- Collect Mac memory (vm_stat — instant) --
+        # -- Mac memory (all modes) --
         local v0="--"
         local vm_out page_sz total_bytes
         vm_out="$(vm_stat 2>/dev/null || true)"
@@ -771,50 +810,52 @@ cmd_monitor() {
             v0="$(printf "%.0fG/%d%%" "${mu}" "${mp}")"
         fi
 
-        # -- Collect Mac GPU (ioreg — instant, no sudo) --
+        # -- Mac GPU (all modes) --
         local v1="--"
         local mgu
         mgu="$(ioreg -r -d 1 -c IOAccelerator 2>/dev/null \
             | grep -o '"Device Utilization %"=[0-9]*' \
-            | grep -o '[0-9]*$' | head -1 || true)"
+            | awk -F'=' '{print $NF}' | head -1 || true)"
         [[ -n "${mgu}" ]] && v1="${mgu}%"
 
-        # -- Collect DGX stats (single SSH call) --
         local v2="--" v3="--" v4="--"
-        if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
-                "${DGX_USER}@${DGX_HOST}" &>/dev/null 2>&1; then
-            local ds=""
-            ds="$(ssh_dgx bash -c "'
-                echo \"MEM:\$(free -m 2>/dev/null | awk \"/^Mem:/{printf \\\"%d %d\\\", \\\$3, \\\$2}\")\"
-                echo \"GPU_UTIL:\$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d \" \")\"
-                echo \"GPU_MEM:\$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)\"
-                echo \"RPC:\$(pgrep -x rpc-server >/dev/null 2>&1 && echo UP || echo DOWN)\"
-            '" 2>/dev/null || true)"
+        if [[ "${monitor_mode}" == "DISTRIBUTED" ]]; then
+            # -- DGX stats (distributed only) --
+            if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+                    "${DGX_USER}@${DGX_HOST}" &>/dev/null 2>&1; then
+                local ds=""
+                ds="$(ssh_dgx bash -c "'
+                    echo \"MEM:\$(free -m 2>/dev/null | awk \"/^Mem:/{printf \\\"%d %d\\\", \\\$3, \\\$2}\")\"
+                    echo \"GPU_UTIL:\$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d \" \")\"
+                    echo \"GPU_MEM:\$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)\"
+                    echo \"RPC:\$(pgrep -x rpc-server >/dev/null 2>&1 && echo UP || echo DOWN)\"
+                '" 2>/dev/null || true)"
 
-            if [[ -n "${ds}" ]]; then
-                local ml; ml="$(echo "${ds}" | grep '^MEM:' | sed 's/^MEM://')"
-                if [[ -n "${ml}" ]]; then
-                    local dm dt
-                    read -r dm dt <<< "${ml}"
-                    if [[ -n "${dt}" ]] && (( dt > 0 )); then
-                        v2="$(printf "%dG/%d%%" "$(( dm / 1024 ))" "$(( dm * 100 / dt ))")"
+                if [[ -n "${ds}" ]]; then
+                    local ml; ml="$(echo "${ds}" | grep '^MEM:' | sed 's/^MEM://')"
+                    if [[ -n "${ml}" ]]; then
+                        local dm dt
+                        read -r dm dt <<< "${ml}"
+                        if [[ -n "${dt}" ]] && (( dt > 0 )); then
+                            v2="$(printf "%dG/%d%%" "$(( dm / 1024 ))" "$(( dm * 100 / dt ))")"
+                        fi
                     fi
+                    local gu gm
+                    gu="$(echo "${ds}" | grep '^GPU_UTIL:' | sed 's/^GPU_UTIL://')"
+                    gm="$(echo "${ds}" | grep '^GPU_MEM:' | sed 's/^GPU_MEM://')"
+                    if [[ "${gm}" =~ ^[0-9] ]]; then
+                        local mu2 mt2; IFS=', ' read -r mu2 mt2 <<< "${gm}"
+                        local gm_gb; gm_gb="$(echo "scale=0; ${mu2} / 1024" | bc)"
+                        v3="$(printf "%s%%/%dG" "${gu:-?}" "${gm_gb}")"
+                    elif [[ -n "${gu}" ]]; then
+                        v3="${gu}%/UMA"
+                    fi
+                    v4="$(echo "${ds}" | grep '^RPC:' | sed 's/^RPC://')"
                 fi
-                local gu gm
-                gu="$(echo "${ds}" | grep '^GPU_UTIL:' | sed 's/^GPU_UTIL://')"
-                gm="$(echo "${ds}" | grep '^GPU_MEM:' | sed 's/^GPU_MEM://')"
-                if [[ "${gm}" =~ ^[0-9] ]]; then
-                    local mu2 mt2; IFS=', ' read -r mu2 mt2 <<< "${gm}"
-                    local gm_gb; gm_gb="$(echo "scale=0; ${mu2} / 1024" | bc)"
-                    v3="$(printf "%s%%/%dG" "${gu:-?}" "${gm_gb}")"
-                elif [[ -n "${gu}" ]]; then
-                    v3="${gu}%/UMA"
-                fi
-                v4="$(echo "${ds}" | grep '^RPC:' | sed 's/^RPC://')"
             fi
         fi
 
-        # -- Collect llama-server health + metrics --
+        # -- llama-server metrics (all modes) --
         local v5="DOWN" v6="--" v7="--" v8="--" v9="--" v10="--"
         if curl -sf "http://127.0.0.1:${LLAMA_PORT}/health" &>/dev/null; then
             v5="UP"
@@ -830,13 +871,14 @@ cmd_monitor() {
             fi
         fi
 
-        # -- Append to history --
+        # -- Append to history (row r → hist var via row_hist mapping) --
         h_ts+=("${ts}")
-        h0+=("${v0}"); h1+=("${v1}"); h2+=("${v2}"); h3+=("${v3}"); h4+=("${v4}")
-        h5+=("${v5}"); h6+=("${v6}"); h7+=("${v7}"); h8+=("${v8}"); h9+=("${v9}"); h10+=("${v10}")
+        local -a vals=("${v0}" "${v1}" "${v2}" "${v3}" "${v4}" "${v5}" "${v6}" "${v7}" "${v8}" "${v9}" "${v10}")
+        for (( r = 0; r < n_rows; r++ )); do
+            eval "${row_hist[$r]}+=(\"\${vals[$r]}\")"
+        done
 
         # -- Calculate rolling window --
-        # Each column: 1 border (│) + col_w data chars = col_w+1
         local mc total start
         total=${#h_ts[@]}
         mc=$(( (table_w - lbl_w) / (col_w + 1) ))
@@ -867,7 +909,7 @@ cmd_monitor() {
         for (( r = 0; r < n_rows; r++ )); do
             printf "\033[2K${BOLD}%-${lbl_w}s${RESET}" "${labels[$r]}"
             for (( i = start; i < total; i++ )); do
-                eval "val=\"\${h${r}[\$i]}\""
+                eval "val=\"\${${row_hist[$r]}[$i]}\""
                 color="${RESET}"
                 [[ "${val}" == "UP" ]]   && color="${GREEN}"
                 [[ "${val}" == "DOWN" ]] && color="${RED}"
