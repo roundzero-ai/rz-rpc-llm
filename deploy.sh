@@ -916,6 +916,39 @@ cmd_monitor() {
                 color="${RESET}"
                 [[ "${val}" == "UP" ]]   && color="${GREEN}"
                 [[ "${val}" == "DOWN" ]] && color="${RED}"
+                if [[ "${val}" =~ ^[0-9]+\.?[0-9]*G/[0-9]+%$ ]]; then
+                    local ram_pct; ram_pct="${val##*/}"; ram_pct="${ram_pct%%%}"
+                    if (( ram_pct < 50 )); then
+                        color="${GREEN}"
+                    elif (( ram_pct < 80 )); then
+                        color="${YELLOW}"
+                    else
+                        color="${RED}"
+                    fi
+                elif [[ "${labels[$r]}" == "tg (t/s)" && "${val}" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+                    local tg_val; tg_val="$(echo "${val}" | cut -d'.' -f1)"
+                    if (( tg_val > 20 )); then
+                        color="${GREEN}"
+                    elif (( tg_val < 10 )); then
+                        color="${RED}"
+                    fi
+                elif [[ "${labels[$r]}" == "pp (t/s)" && "${val}" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+                    local pp_val; pp_val="$(echo "${val}" | cut -d'.' -f1)"
+                    if (( pp_val > 400 )); then
+                        color="${GREEN}"
+                    elif (( pp_val < 250 )); then
+                        color="${RED}"
+                    fi
+                elif [[ "${val}" =~ ^[0-9]+%$ ]]; then
+                    local gpu_pct; gpu_pct="${val%\%}"
+                    if (( gpu_pct < 30 )); then
+                        color="${GREEN}"
+                    elif (( gpu_pct < 70 )); then
+                        color="${YELLOW}"
+                    else
+                        color="${RED}"
+                    fi
+                fi
                 printf "│${color}%${col_w}s${RESET}" "${val}"
             done
             printf "│\n"
