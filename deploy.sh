@@ -1068,7 +1068,7 @@ cmd_monitor() {
         printf "┘\n"
 
         # Reserve space for live log section
-        local live_rows=12
+        local live_rows=7
         local i
         for (( i = 0; i < live_rows; i++  )); do
             echo
@@ -1138,7 +1138,7 @@ cmd_monitor() {
                     fi
 
                     h_ts+=("${ts}")
-                    snap+=("${v0}|${v1}|${v5}|${v6}|${v7}|${v8}|${v9}|${v10}")
+                    snap+=("${v0}|${v1}|${v2}|${v3}|${v4}|${v5}|${v6}|${v7}|${v8}|${v9}|${v10}")
                 fi
 
                 # Draw full screen from top (cursor to home)
@@ -1235,7 +1235,7 @@ cmd_monitor() {
             fast_elapsed=$(( fast_elapsed + fast_interval ))
 
             if [[ -f "${log_file}" ]]; then
-                local last_lines; last_lines="$(tail -20 "${log_file}" 2>/dev/null || true)"
+                local last_lines; last_lines="$(tail -5 "${log_file}" 2>/dev/null || true)"
                 if [[ -n "${last_lines}" ]]; then
                     local ts_fast; ts_fast="$(date '+%H:%M:%S')"
 
@@ -1250,9 +1250,9 @@ cmd_monitor() {
                     # Now at start of live section
 
                     printf "${BOLD}%-20s${RESET}" "⚡ live @ ${ts_fast}"
-                    printf " %s\r\n" "--- llama-server log (last 10 lines) ---"
+                    printf " %s\r\n" "--- llama-server log (last 5 lines) ---"
 
-                    echo "${last_lines}" | tail -10 | while IFS= read -r line; do
+                    echo "${last_lines}" | tail -5 | while IFS= read -r line; do
                         printf "${RESET}%-80s${RESET}\r\n" "${line:0:80}"
                     done
                 fi
