@@ -766,22 +766,25 @@ cmd_monitor() {
     )
 
     local -a labels
-    local -a row_hist  # maps row r → history array variable name (h0..h10)
     local n_rows
     if [[ "${monitor_mode}" == "VISION" ]]; then
         labels=("${labels_vision[@]}")
-        row_hist=(h0 h1 h5 h6 h7 h8 h9 h10)
         n_rows=8
     else
         labels=("${labels_distributed[@]}")
-        row_hist=(h0 h1 h2 h3 h4 h5 h6 h7 h8 h9 h10)
         n_rows=11
     fi
     local table_h=$(( n_rows + 3 ))
 
-    # History arrays
+    local -a vals_idx
+    if [[ "${monitor_mode}" == "VISION" ]]; then
+        vals_idx=(0 1 5 6 7 8 9 10)
+    else
+        vals_idx=(0 1 2 3 4 5 6 7 8 9 10)
+    fi
+
     local -a h_ts=()
-    declare -a h0=() h1=() h2=() h3=() h4=() h5=() h6=() h7=() h8=() h9=() h10=()
+    local -a snap=()
 
     # Reserve vertical space for the table
     local i
@@ -820,7 +823,6 @@ cmd_monitor() {
 
         local v2="--" v3="--" v4="--"
         if [[ "${monitor_mode}" == "DISTRIBUTED" ]]; then
-            # -- DGX stats (distributed only) --
             if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
                     "${DGX_USER}@${DGX_HOST}" &>/dev/null 2>&1; then
                 local ds=""
@@ -830,7 +832,6 @@ cmd_monitor() {
                     echo \"GPU_MEM:\$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)\"
                     echo \"RPC:\$(pgrep -x rpc-server >/dev/null 2>&1 && echo UP || echo DOWN)\"
                 '" 2>/dev/null || true)"
-
                 if [[ -n "${ds}" ]]; then
                     local ml; ml="$(echo "${ds}" | grep '^MEM:' | sed 's/^MEM://')"
                     if [[ -n "${ml}" ]]; then
@@ -856,27 +857,28 @@ cmd_monitor() {
         fi
 
         # -- llama-server metrics (all modes) --
-        local v5="DOWN" v6="--" v7="--" v8="--" v9="--" v10="--"
+        local met pp_val tg_val reqs_val prompt_total pred_total
+        v5="DOWN"; v6="--"; v7="--"; v8="--"; v9="--"; v10="--"
         if curl -sf "http://127.0.0.1:${LLAMA_PORT}/health" &>/dev/null; then
             v5="UP"
-            local met
             met="$(curl -sf "http://127.0.0.1:${LLAMA_PORT}/metrics" 2>/dev/null || true)"
             if [[ -n "${met}" ]]; then
-                local x
-                x="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_seconds[{ ]/{printf "%.1f", $NF; exit}')";    [[ -n "$x" ]] && v6="$x"
-                x="$(echo "${met}" | awk '/^llamacpp:predicted_tokens_seconds[{ ]/{printf "%.1f", $NF; exit}')"; [[ -n "$x" ]] && v7="$x"
-                x="$(echo "${met}" | awk '/^llamacpp:requests_processing[{ ]/{printf "%d", $NF; exit}')";        [[ -n "$x" ]] && v8="$x"
-                x="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_total[{ ]/{v=$NF; if(v>=1e6) printf "%.1fM",v/1e6; else if(v>=1e3) printf "%.1fK",v/1e3; else printf "%d",v; exit}')";        [[ -n "$x" ]] && v9="$x"
-                x="$(echo "${met}" | awk '/^llamacpp:tokens_predicted_total[{ ]/{v=$NF; if(v>=1e6) printf "%.1fM",v/1e6; else if(v>=1e3) printf "%.1fK",v/1e3; else printf "%d",v; exit}')";     [[ -n "$x" ]] && v10="$x"
+                pp_val="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_seconds /{printf "%.1f", $NF; exit}')"
+                [[ -n "${pp_val}" ]] && v6="${pp_val}"
+                tg_val="$(echo "${met}" | awk '/^llamacpp:predicted_tokens_seconds /{printf "%.1f", $NF; exit}')"
+                [[ -n "${tg_val}" ]] && v7="${tg_val}"
+                reqs_val="$(echo "${met}" | awk '/^llamacpp:requests_processing /{printf "%d", $NF; exit}')"
+                [[ -n "${reqs_val}" ]] && v8="${reqs_val}"
+                prompt_total="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_total /{v=$NF; if(v>=1e6) printf "%.1fM",v/1e6; else if(v>=1e3) printf "%.1fK",v/1e3; else printf "%d",v; exit}')"
+                [[ -n "${prompt_total}" ]] && v9="${prompt_total}"
+                pred_total="$(echo "${met}" | awk '/^llamacpp:tokens_predicted_total /{v=$NF; if(v>=1e6) printf "%.1fM",v/1e6; else if(v>=1e3) printf "%.1fK",v/1e3; else printf "%d",v; exit}')"
+                [[ -n "${pred_total}" ]] && v10="${pred_total}"
             fi
         fi
 
-        # -- Append to history (row r → hist var via row_hist mapping) --
+        # -- Append snapshot --
         h_ts+=("${ts}")
-        local -a vals=("${v0}" "${v1}" "${v2}" "${v3}" "${v4}" "${v5}" "${v6}" "${v7}" "${v8}" "${v9}" "${v10}")
-        for (( r = 0; r < n_rows; r++ )); do
-            eval "${row_hist[$r]}+=(\"\${vals[$r]}\")"
-        done
+        snap+=("${v0}|${v1}|${v2}|${v3}|${v4}|${v5}|${v6}|${v7}|${v8}|${v9}|${v10}")
 
         # -- Calculate rolling window --
         local mc total start
@@ -905,11 +907,12 @@ cmd_monitor() {
         printf "┤\n"
 
         # Data rows
-        local r val color
+        local r val color f
         for (( r = 0; r < n_rows; r++ )); do
             printf "\033[2K${BOLD}%-${lbl_w}s${RESET}" "${labels[$r]}"
             for (( i = start; i < total; i++ )); do
-                eval "val=\"\${${row_hist[$r]}[$i]}\""
+                f="${vals_idx[$r]}"
+                val="$(echo "${snap[$i]}" | cut -d'|' -f$((f+1)))"
                 color="${RESET}"
                 [[ "${val}" == "UP" ]]   && color="${GREEN}"
                 [[ "${val}" == "DOWN" ]] && color="${RED}"
