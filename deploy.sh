@@ -32,7 +32,7 @@ LOG_DIR="${SCRIPT_DIR}/logs"
 # ------------------------------------------------------------------------------
 # Colours & logging
 # ------------------------------------------------------------------------------
-RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
 log()         { echo -e "${CYAN}[$(date '+%H:%M:%S')]${RESET} $*"; }
@@ -774,7 +774,7 @@ cmd_monitor() {
         labels=("${labels_distributed[@]}")
         n_rows=11
     fi
-    local table_h=$(( n_rows + 3 ))
+    local table_h=$(( n_rows + 3 ))  # +3 for header/sep/bottom
 
     local -a vals_idx
     if [[ "${monitor_mode}" == "VISION" ]]; then
@@ -961,7 +961,197 @@ cmd_monitor() {
         done
         printf "┘\n"
 
-        sleep "${interval}"
+        # Reserve space for live log section
+        local live_rows=12
+        local i
+        for (( i = 0; i < live_rows; i++  )); do
+            echo
+        done
+        printf "\033[${live_rows}A"  # Move cursor back to start of live section
+
+        # -- Main loop: rolling table every 30s, live log every 3s --
+        local fast_interval=3
+        local fast_elapsed=0
+        local log_file="${LOG_DIR}/llama-server.log"
+
+        while true; do
+            # Every 30s: accumulate a new snapshot for rolling table
+            if (( fast_elapsed > 0 )) && (( fast_elapsed % interval == 0 )) || (( fast_elapsed == 0 )); then
+                # Check if we need to reinitialize (fast_elapsed == 0 means first time)
+                if (( fast_elapsed == 0 )); then
+                    # First time: accumulate snapshot, then draw everything
+                    :
+                else
+                    # Get new snapshot and draw rolling table
+                    local ts; ts="$(date '+%H:%M:%S')"
+
+                    # Mac memory
+                    local v0="--"
+                    local vm_out page_sz total_bytes
+                    vm_out="$(vm_stat 2>/dev/null || true)"
+                    page_sz="$(echo "${vm_out}" | awk -F'[()]' '/page size of/{gsub(/[^0-9]/,"",$2); print $2}')"
+                    total_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+                    if [[ -n "${page_sz}" ]] && (( total_bytes > 0 )); then
+                        local fp sp ip mt mf mu mp
+                        fp="$(echo "${vm_out}" | awk '/Pages free/{gsub(/\./,""); print $3}')"
+                        sp="$(echo "${vm_out}" | awk '/Pages speculative/{gsub(/\./,""); print $3}')"
+                        ip="$(echo "${vm_out}" | awk '/Pages inactive/{gsub(/\./,""); print $3}')"
+                        mt="$(echo "scale=1; ${total_bytes} / 1073741824" | bc)"
+                        mf="$(echo "scale=1; (${fp:-0} + ${sp:-0} + ${ip:-0}) * ${page_sz} / 1073741824" | bc)"
+                        mu="$(echo "scale=1; ${mt} - ${mf}" | bc)"
+                        mp="$(echo "scale=0; ${mu} * 100 / ${mt}" | bc)"
+                        v0="$(printf "%.0fG/%d%%" "${mu}" "${mp}")"
+                    fi
+
+                    # Mac GPU
+                    local v1="--"
+                    local mgu
+                    mgu="$(ioreg -r -d 1 -c IOAccelerator 2>/dev/null \
+                        | grep -o '"Device Utilization %"=[0-9]*' \
+                        | awk -F'=' '{print $NF}' | head -1 || true)"
+                    [[ -n "${mgu}" ]] && v1="${mgu}%"
+
+                    # llama-server metrics
+                    local met pp_val tg_val reqs_val prompt_total pred_total
+                    v5="DOWN"; v6="--"; v7="--"; v8="--"; v9="--"; v10="--"
+                    if curl -sf "http://127.0.0.1:${LLAMA_PORT}/health" &>/dev/null; then
+                        v5="UP"
+                        met="$(curl -sf "http://127.0.0.1:${LLAMA_PORT}/metrics" 2>/dev/null || true)"
+                        if [[ -n "${met}" ]]; then
+                            pp_val="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_seconds /{printf "%.1f", $NF; exit}')"
+                            [[ -n "${pp_val}" ]] && v6="${pp_val}"
+                            tg_val="$(echo "${met}" | awk '/^llamacpp:predicted_tokens_seconds /{printf "%.1f", $NF; exit}')"
+                            [[ -n "${tg_val}" ]] && v7="${tg_val}"
+                            reqs_val="$(echo "${met}" | awk '/^llamacpp:requests_processing /{printf "%d", $NF; exit}')"
+                            [[ -n "${reqs_val}" ]] && v8="${reqs_val}"
+                            prompt_total="$(echo "${met}" | awk '/^llamacpp:prompt_tokens_total /{v=$NF; if(v>=1e6) printf "%.1fM",v/1e6; else if(v>=1e3) printf "%.1fK",v/1e3; else printf "%d",v; exit}')"
+                            [[ -n "${prompt_total}" ]] && v9="${prompt_total}"
+                            pred_total="$(echo "${met}" | awk '/^llamacpp:tokens_predicted_total /{v=$NF; if(v>=1e6) printf "%.1fM",v/1e6; else if(v>=1e3) printf "%.1fK",v/1e3; else printf "%d",v; exit}')"
+                            [[ -n "${pred_total}" ]] && v10="${pred_total}"
+                        fi
+                    fi
+
+                    h_ts+=("${ts}")
+                    snap+=("${v0}|${v1}|${v5}|${v6}|${v7}|${v8}|${v9}|${v10}")
+                fi
+
+                # Draw full screen from top (cursor to home)
+                printf "\033[H"
+                tput civis 2>/dev/null || true  # hide cursor
+
+                # Rolling table (draw in top portion)
+                local mc total start
+                total=${#h_ts[@]}
+                mc=$(( (table_w - lbl_w) / (col_w + 1) ))
+                (( mc < 1 )) && mc=1
+                start=0
+                (( total > mc )) && start=$(( total - mc ))
+
+                # Header row
+                local col_sep; col_sep="$(printf '%*s' "${col_w}" '' | tr ' ' '─')"
+                printf "${BOLD}%-${lbl_w}s${RESET}" ""
+                for (( i = start; i < total; i++ )); do
+                    printf "│${CYAN}%${col_w}s${RESET}" "${h_ts[$i]}"
+                done
+                printf "│\n"
+
+                # Separator
+                printf "%s" "$(printf '%*s' "${lbl_w}" '' | tr ' ' '─')"
+                for (( i = start; i < total; i++ )); do
+                    printf "┼%s" "${col_sep}"
+                done
+                printf "┤\n"
+
+                # Data rows
+                local r val color f
+                for (( r = 0; r < n_rows; r++ )); do
+                    printf "${BOLD}%-${lbl_w}s${RESET}" "${labels[$r]}"
+                    for (( i = start; i < total; i++ )); do
+                        f="${vals_idx[$r]}"
+                        val="$(echo "${snap[$i]}" | cut -d'|' -f$((f+1)))"
+                        color="${RESET}"
+                        [[ "${val}" == "UP" ]]   && color="${GREEN}"
+                        [[ "${val}" == "DOWN" ]] && color="${RED}"
+                        if [[ "${val}" =~ ^[0-9]+\.?[0-9]*G/[0-9]+%$ ]]; then
+                            local ram_pct; ram_pct="${val##*/}"; ram_pct="${ram_pct%%%}"
+                            if (( ram_pct < 50 )); then
+                                color="${GREEN}"
+                            elif (( ram_pct < 80 )); then
+                                color="${YELLOW}"
+                            else
+                                color="${RED}"
+                            fi
+                        elif [[ "${labels[$r]}" == "tg (t/s)" && "${val}" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+                            local tg_val; tg_val="$(echo "${val}" | cut -d'.' -f1)"
+                            if (( tg_val > 20 )); then
+                                color="${GREEN}"
+                            elif (( tg_val < 10 )); then
+                                color="${RED}"
+                            fi
+                        elif [[ "${labels[$r]}" == "pp (t/s)" && "${val}" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+                            local pp_val; pp_val="$(echo "${val}" | cut -d'.' -f1)"
+                            if (( pp_val > 400 )); then
+                                color="${GREEN}"
+                            elif (( pp_val < 250 )); then
+                                color="${RED}"
+                            fi
+                        elif [[ "${val}" =~ ^[0-9]+%$ ]]; then
+                            local gpu_pct; gpu_pct="${val%\%}"
+                            if (( gpu_pct < 30 )); then
+                                color="${GREEN}"
+                            elif (( gpu_pct < 70 )); then
+                                color="${YELLOW}"
+                            else
+                                color="${RED}"
+                            fi
+                        fi
+                        printf "│${color}%${col_w}s${RESET}" "${val}"
+                    done
+                    printf "│\n"
+                done
+
+                # Bottom border
+                printf "%s" "$(printf '%*s' "${lbl_w}" '' | tr ' ' '─')"
+                for (( i = start; i < total; i++ )); do
+                    printf "┴%s" "${col_sep}"
+                done
+                printf "┘\n"
+
+                # Reserve live section space
+                for (( i = 0; i < live_rows; i++  )); do
+                    echo
+                done
+                fast_elapsed=0
+            fi
+
+            # Every 3s: update live log section only (in place)
+            sleep "${fast_interval}"
+            fast_elapsed=$(( fast_elapsed + fast_interval ))
+
+            if [[ -f "${log_file}" ]]; then
+                local last_lines; last_lines="$(tail -20 "${log_file}" 2>/dev/null || true)"
+                if [[ -n "${last_lines}" ]]; then
+                    local ts_fast; ts_fast="$(date '+%H:%M:%S')"
+
+                    # Calculate position: cursor is at line after rolling table + live_rows
+                    # Move cursor to start of live section (table_h lines from top, but rolling table redraws itself)
+                    # Since we redrew everything from \033[H, cursor is now at the reserved space
+                    # So just clear and overwrite
+                    for (( i = 0; i < live_rows; i++  )); do
+                        printf "\033[2K\r"  # Clear line and return to start
+                        [[ $i -lt $(( live_rows - 1 )) ]] && printf "\033[1A"  # Move up one line
+                    done
+                    # Now at start of live section
+
+                    printf "${BOLD}%-20s${RESET}" "⚡ live @ ${ts_fast}"
+                    printf " %s\r\n" "--- llama-server log (last 10 lines) ---"
+
+                    echo "${last_lines}" | tail -10 | while IFS= read -r line; do
+                        printf "${RESET}%-80s${RESET}\r\n" "${line:0:80}"
+                    done
+                fi
+            fi
+        done
     done
 }
 
