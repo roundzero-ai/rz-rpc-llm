@@ -64,8 +64,9 @@ Two deployment modes:
 ```
 rz-rpc-llm/
 ├── deploy.sh           # Main deployment script (all commands)
-├── config.env.example  # Template — copy to config.env
-├── config.env          # Local config (gitignored, contains secrets)
+├── defaults.env        # Checked-in non-secret defaults
+├── config.env.example  # Optional local override template
+├── config.env          # Optional local overrides (gitignored)
 ├── .gitignore
 ├── README.md
 ├── llama.cpp/          # Cloned llama.cpp source (gitignored)
@@ -96,18 +97,25 @@ cd rz-rpc-llm
 chmod +x deploy.sh
 ```
 
-### 2. Configure
+### 2. Configure (optional)
 
 ```bash
+# Vision mode can run directly from checked-in defaults.
+# Only create config.env if you want local overrides.
 cp config.env.example config.env
 ```
 
-Edit `config.env` — at minimum set:
+Common local overrides:
 
 ```bash
-DGX_HOST="192.168.86.242"   # DGX IP address (for distributed mode)
+DGX_HOST="192.168.86.242"    # DGX IP address (distributed mode)
 DGX_USER="your_user"         # SSH username on DGX
-HF_TOKEN="hf_..."            # Hugging Face token
+```
+
+For gated Hugging Face downloads, set your token in the shell instead of any project file:
+
+```bash
+export HF_TOKEN="hf_..."
 ```
 
 ### 3. Choose your deployment mode
@@ -181,6 +189,7 @@ Splits MiniMax-M2.5 across Mac Studio + DGX Spark via RPC. Best for pure text in
 - Context: 131,072 tokens
 - Tensor split: 2:3 (Mac:DGX)
 - KV cache: q8_0 quantization
+- Sampling: temp 1.0 / top_p 0.95 / top_k 40 / min_p 0.01
 
 ---
 
@@ -275,7 +284,7 @@ gen tokens          │      3.5K  │      4.2K  │      5.8K  │      7.1K  
 
 ---
 
-## Configuration Reference (`config.env`)
+## Configuration Reference (`defaults.env` + optional `config.env`)
 
 ### Connection
 
@@ -301,6 +310,7 @@ gen tokens          │      3.5K  │      4.2K  │      5.8K  │      7.1K  
 | Variable | Default | Description |
 |---|---|---|
 | `DEFAULT_VISION_REPO` | `unsloth/Qwen3.5-122B-A10B-GGUF` | HuggingFace repo |
+| `DEFAULT_VISION_MODEL_PATTERN` | `*UD-Q6_K_XL*` | GGUF glob for vision downloads |
 | `DEFAULT_VISION_MODEL_FILE` | `UD-Q6_K_XL/...-00001-of-00004.gguf` | GGUF file (first shard) |
 | `DEFAULT_VISION_MM_PROJ` | `mmproj-BF16.gguf` | Vision projector file |
 | `DEFAULT_VISION_ALIAS` | `qwen3.5-122b-vision` | Model alias for API |
@@ -344,6 +354,12 @@ gen tokens          │      3.5K  │      4.2K  │      5.8K  │      7.1K  
 
 | Variable | Default | Description |
 |---|---|---|
+| `LLAMA_TEXT_TEMP` | `1.0` | MiniMax default temperature |
+| `LLAMA_TEXT_TOP_P` | `0.95` | MiniMax default top-p |
+| `LLAMA_TEXT_TOP_K` | `40` | MiniMax default top-k |
+| `LLAMA_TEXT_MIN_P` | `0.01` | MiniMax default min-p |
+| `LLAMA_TEXT_REPEAT_PENALTY` | `1.0` | MiniMax repetition penalty |
+| `LLAMA_TEXT_PRESENCE_PENALTY` | `0.0` | MiniMax presence penalty |
 | `LLAMA_TEMP` | `1.0` | Temperature (general reasoning) |
 | `LLAMA_TOP_P` | `0.95` | Top-p sampling |
 | `LLAMA_TOP_K` | `20` | Top-k sampling |
@@ -359,6 +375,23 @@ gen tokens          │      3.5K  │      4.2K  │      5.8K  │      7.1K  
 | `LLAMA_TOP_P_INSTRUCT` | `0.8` | Top-p for instruct mode |
 | `LLAMA_TOP_K_INSTRUCT` | `20` | Top-k for instruct mode |
 | `LLAMA_PRESENCE_PENALTY_INSTRUCT` | `1.5` | Instruct presence penalty |
+
+---
+
+## MiniMax-M2.5 Sampling Guide
+
+Distributed mode uses MiniMax-M2.5 defaults from Unsloth's llama.cpp guide:
+
+| Setting | Value |
+|---|---|
+| `temperature` | `1.0` |
+| `top_p` | `0.95` |
+| `top_k` | `40` |
+| `min_p` | `0.01` |
+| `repeat_penalty` | `1.0` |
+| `presence_penalty` | `0.0` |
+
+These are baked into `./deploy.sh start-llama` for distributed mode unless you override them in `config.env` with the `LLAMA_TEXT_*` variables.
 
 ---
 
@@ -505,7 +538,7 @@ cmake -B build \
 ./deploy.sh logs llama
 ```
 Common causes:
-- Model file path wrong (check `DEFAULT_MODEL_FILE` in `config.env`)
+- Model file path wrong (check `DEFAULT_MODEL_FILE` in `defaults.env` or your `config.env` override)
 - Not enough RAM — model + KV cache must fit in memory
 - rpc-server not running (for distributed mode)
 - llama.cpp version mismatch between Mac and DGX builds
@@ -516,7 +549,7 @@ Common causes:
 - Ensure enough free memory
 
 **HF download fails:**
-- Set `HF_TOKEN` in `config.env` or export in shell
+- Export `HF_TOKEN` in your shell
 - Accept model license on huggingface.co
 - Ensure `huggingface-cli` is installed: `pip install huggingface_hub`
 

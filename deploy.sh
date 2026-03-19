@@ -25,6 +25,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULTS_FILE="${SCRIPT_DIR}/defaults.env"
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
 PID_DIR="${SCRIPT_DIR}/.pids"
 LOG_DIR="${SCRIPT_DIR}/logs"
@@ -48,12 +49,31 @@ die()         { log_error "$*"; exit 1; }
 # Load configuration
 # ------------------------------------------------------------------------------
 load_config() {
-    if [[ ! -f "${CONFIG_FILE}" ]]; then
-        die "config.env not found. Copy config.env.example → config.env and edit it."
+    local env_dgx_host="${DGX_HOST-}"
+    local env_dgx_user="${DGX_USER-}"
+    local env_dgx_remote_dir="${DGX_REMOTE_DIR-}"
+    local env_hf_token="${HF_TOKEN-}"
+
+    if [[ ! -f "${DEFAULTS_FILE}" ]]; then
+        die "defaults.env not found. Re-clone the repo or restore the checked-in defaults file."
     fi
+
     # shellcheck source=/dev/null
-    source "${CONFIG_FILE}"
-    log "Loaded config: ${CONFIG_FILE}"
+    source "${DEFAULTS_FILE}"
+    log "Loaded defaults: ${DEFAULTS_FILE}"
+
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        # shellcheck source=/dev/null
+        source "${CONFIG_FILE}"
+        log "Loaded local overrides: ${CONFIG_FILE}"
+    else
+        log "No local override file at ${CONFIG_FILE} (using checked-in defaults only)"
+    fi
+
+    [[ -n "${env_dgx_host}" ]] && DGX_HOST="${env_dgx_host}"
+    [[ -n "${env_dgx_user}" ]] && DGX_USER="${env_dgx_user}"
+    [[ -n "${env_dgx_remote_dir}" ]] && DGX_REMOTE_DIR="${env_dgx_remote_dir}"
+    [[ -n "${env_hf_token}" ]] && HF_TOKEN="${env_hf_token}"
 
     # Expand relative paths relative to SCRIPT_DIR
     if [[ "${LLAMA_CPP_DIR}" != /* ]]; then
@@ -69,11 +89,50 @@ load_config() {
     LLAMA_CONT_BATCHING="${LLAMA_CONT_BATCHING:-1}"
     LLAMA_NO_CONTEXT_SHIFT="${LLAMA_NO_CONTEXT_SHIFT:-0}"
 
+    # Mode-specific model patterns and runtime defaults
+    DEFAULT_VISION_MODEL_PATTERN="${DEFAULT_VISION_MODEL_PATTERN:-${DEFAULT_MODEL_PATTERN:-*UD-Q6_K_XL*}}"
+
+    LLAMA_TEXT_CTX_SIZE="${LLAMA_TEXT_CTX_SIZE:-${LLAMA_CTX_SIZE:-131072}}"
+    LLAMA_TEXT_PARALLEL="${LLAMA_TEXT_PARALLEL:-${LLAMA_PARALLEL:-1}}"
+    LLAMA_TEXT_BATCH_SIZE="${LLAMA_TEXT_BATCH_SIZE:-${LLAMA_BATCH_SIZE:-2048}}"
+    LLAMA_TEXT_UBATCH_SIZE="${LLAMA_TEXT_UBATCH_SIZE:-${LLAMA_UBATCH_SIZE:-512}}"
+    LLAMA_TEXT_N_GPU_LAYERS="${LLAMA_TEXT_N_GPU_LAYERS:-${LLAMA_N_GPU_LAYERS:-all}}"
+    LLAMA_TEXT_CACHE_TYPE_K="${LLAMA_TEXT_CACHE_TYPE_K:-${LLAMA_CACHE_TYPE_K:-q8_0}}"
+    LLAMA_TEXT_CACHE_TYPE_V="${LLAMA_TEXT_CACHE_TYPE_V:-${LLAMA_CACHE_TYPE_V:-q8_0}}"
+    LLAMA_TEXT_TEMP="${LLAMA_TEXT_TEMP:-1.0}"
+    LLAMA_TEXT_TOP_P="${LLAMA_TEXT_TOP_P:-0.95}"
+    LLAMA_TEXT_TOP_K="${LLAMA_TEXT_TOP_K:-40}"
+    LLAMA_TEXT_MIN_P="${LLAMA_TEXT_MIN_P:-0.01}"
+    LLAMA_TEXT_REPEAT_PENALTY="${LLAMA_TEXT_REPEAT_PENALTY:-1.0}"
+    LLAMA_TEXT_PRESENCE_PENALTY="${LLAMA_TEXT_PRESENCE_PENALTY:-0.0}"
+    LLAMA_TEXT_REASONING_FORMAT="${LLAMA_TEXT_REASONING_FORMAT:-auto}"
+
+    LLAMA_VISION_CTX_SIZE="${LLAMA_VISION_CTX_SIZE:-${LLAMA_CTX_SIZE:-262144}}"
+    LLAMA_VISION_PARALLEL="${LLAMA_VISION_PARALLEL:-${LLAMA_PARALLEL:-1}}"
+    LLAMA_VISION_BATCH_SIZE="${LLAMA_VISION_BATCH_SIZE:-${LLAMA_BATCH_SIZE:-2048}}"
+    LLAMA_VISION_UBATCH_SIZE="${LLAMA_VISION_UBATCH_SIZE:-${LLAMA_UBATCH_SIZE:-512}}"
+    LLAMA_VISION_N_GPU_LAYERS="${LLAMA_VISION_N_GPU_LAYERS:-${LLAMA_N_GPU_LAYERS:-all}}"
+    LLAMA_VISION_CACHE_TYPE_K="${LLAMA_VISION_CACHE_TYPE_K:-${LLAMA_CACHE_TYPE_K:-q8_0}}"
+    LLAMA_VISION_CACHE_TYPE_V="${LLAMA_VISION_CACHE_TYPE_V:-${LLAMA_CACHE_TYPE_V:-q8_0}}"
+    LLAMA_VISION_TEMP="${LLAMA_VISION_TEMP:-${LLAMA_TEMP:-1.0}}"
+    LLAMA_VISION_TOP_P="${LLAMA_VISION_TOP_P:-${LLAMA_TOP_P:-0.95}}"
+    LLAMA_VISION_TOP_K="${LLAMA_VISION_TOP_K:-${LLAMA_TOP_K:-20}}"
+    LLAMA_VISION_MIN_P="${LLAMA_VISION_MIN_P:-${LLAMA_MIN_P:-0.0}}"
+    LLAMA_VISION_REPEAT_PENALTY="${LLAMA_VISION_REPEAT_PENALTY:-${LLAMA_REPEAT_PENALTY:-1.0}}"
+    LLAMA_VISION_PRESENCE_PENALTY="${LLAMA_VISION_PRESENCE_PENALTY:-${LLAMA_PRESENCE_PENALTY:-1.5}}"
+    LLAMA_VISION_REASONING_FORMAT="${LLAMA_VISION_REASONING_FORMAT:-auto}"
+
     # Allow HF_TOKEN override from environment
     HF_TOKEN="${HF_TOKEN:-}"
     if [[ -n "${HF_TOKEN_ENV:-}" ]]; then
         HF_TOKEN="${HF_TOKEN_ENV}"
     fi
+}
+
+require_dgx_config() {
+    [[ -n "${DGX_HOST:-}" ]] || die "DGX_HOST is empty. Set it in config.env or your shell for distributed mode."
+    [[ -n "${DGX_USER:-}" ]] || die "DGX_USER is empty. Set it in config.env or your shell for distributed mode."
+    [[ -n "${DGX_REMOTE_DIR:-}" ]] || die "DGX_REMOTE_DIR is empty. Set it in config.env or your shell for distributed mode."
 }
 
 # Resolve model file (relative to MODELS_DIR if not absolute)
@@ -97,6 +156,48 @@ resolve_latest_local_tag() {
     [[ -n "${latest_tag}" ]] || die "No tags found in ${repo_dir}"
 
     echo "${latest_tag}"
+}
+
+select_runtime_profile() {
+    local vision_mode="${1:-}"
+    local ctx_override="${2:-}"
+    local parallel_override="${3:-}"
+
+    if [[ -n "${vision_mode}" ]]; then
+        RUNTIME_PROFILE_NAME="Qwen3.5-122B-A10B"
+        RUNTIME_PROFILE_KIND="vision"
+        RUNTIME_CTX_SIZE="${ctx_override:-${LLAMA_VISION_CTX_SIZE}}"
+        RUNTIME_PARALLEL="${parallel_override:-${LLAMA_VISION_PARALLEL}}"
+        RUNTIME_BATCH_SIZE="${LLAMA_VISION_BATCH_SIZE}"
+        RUNTIME_UBATCH_SIZE="${LLAMA_VISION_UBATCH_SIZE}"
+        RUNTIME_N_GPU_LAYERS="${LLAMA_VISION_N_GPU_LAYERS}"
+        RUNTIME_CACHE_TYPE_K="${LLAMA_VISION_CACHE_TYPE_K}"
+        RUNTIME_CACHE_TYPE_V="${LLAMA_VISION_CACHE_TYPE_V}"
+        RUNTIME_TEMP="${LLAMA_VISION_TEMP}"
+        RUNTIME_TOP_P="${LLAMA_VISION_TOP_P}"
+        RUNTIME_TOP_K="${LLAMA_VISION_TOP_K}"
+        RUNTIME_MIN_P="${LLAMA_VISION_MIN_P}"
+        RUNTIME_REPEAT_PENALTY="${LLAMA_VISION_REPEAT_PENALTY}"
+        RUNTIME_PRESENCE_PENALTY="${LLAMA_VISION_PRESENCE_PENALTY}"
+        RUNTIME_REASONING_FORMAT="${LLAMA_VISION_REASONING_FORMAT}"
+    else
+        RUNTIME_PROFILE_NAME="MiniMax-M2.5"
+        RUNTIME_PROFILE_KIND="distributed"
+        RUNTIME_CTX_SIZE="${ctx_override:-${LLAMA_TEXT_CTX_SIZE}}"
+        RUNTIME_PARALLEL="${parallel_override:-${LLAMA_TEXT_PARALLEL}}"
+        RUNTIME_BATCH_SIZE="${LLAMA_TEXT_BATCH_SIZE}"
+        RUNTIME_UBATCH_SIZE="${LLAMA_TEXT_UBATCH_SIZE}"
+        RUNTIME_N_GPU_LAYERS="${LLAMA_TEXT_N_GPU_LAYERS}"
+        RUNTIME_CACHE_TYPE_K="${LLAMA_TEXT_CACHE_TYPE_K}"
+        RUNTIME_CACHE_TYPE_V="${LLAMA_TEXT_CACHE_TYPE_V}"
+        RUNTIME_TEMP="${LLAMA_TEXT_TEMP}"
+        RUNTIME_TOP_P="${LLAMA_TEXT_TOP_P}"
+        RUNTIME_TOP_K="${LLAMA_TEXT_TOP_K}"
+        RUNTIME_MIN_P="${LLAMA_TEXT_MIN_P}"
+        RUNTIME_REPEAT_PENALTY="${LLAMA_TEXT_REPEAT_PENALTY}"
+        RUNTIME_PRESENCE_PENALTY="${LLAMA_TEXT_PRESENCE_PENALTY}"
+        RUNTIME_REASONING_FORMAT="${LLAMA_TEXT_REASONING_FORMAT}"
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -186,6 +287,7 @@ cmd_clone() {
 cmd_build_dgx() {
     log_section "Build llama.cpp on DGX Spark GB10"
     load_config
+    require_dgx_config
     check_dgx_ssh
 
     [[ -d "${LLAMA_CPP_DIR}/.git" ]] || die "llama.cpp not cloned. Run: ./deploy.sh clone"
@@ -288,7 +390,7 @@ cmd_download() {
 
     if [[ -n "${vision_mode}" ]]; then
         repo="${repo:-${DEFAULT_VISION_REPO:-unsloth/Qwen3.5-122B-A10B-GGUF}}"
-        pattern="${pattern:-${DEFAULT_MODEL_PATTERN}}"
+        pattern="${pattern:-${DEFAULT_VISION_MODEL_PATTERN}}"
         mmproj_pattern="${DEFAULT_MM_PROJ_PATTERN:-mmproj*.gguf}"
         local_dir="${local_dir:-${MODELS_DIR}}"
 
@@ -353,6 +455,7 @@ cmd_download() {
 cmd_start_rpc() {
     log_section "Start RPC Server on DGX Spark GB10"
     load_config
+    require_dgx_config
     check_dgx_ssh
 
     local log_file="/tmp/rpc-server.log"
@@ -412,6 +515,7 @@ cmd_start_rpc() {
 cmd_stop_rpc() {
     log_section "Stop RPC Server on DGX"
     load_config
+    require_dgx_config
     check_dgx_ssh
 
     if ssh_dgx "pgrep -x rpc-server" &>/dev/null; then
@@ -465,6 +569,8 @@ cmd_start_llama() {
         resolved_mmproj="$(resolve_model_file "${DEFAULT_VISION_MM_PROJ}")"
     fi
 
+    select_runtime_profile "${vision_mode}" "${ctx_size}" "${parallel}"
+
     log_section "Start llama-server on Mac Studio"
     log "Model file : ${resolved_model}"
     log "Model alias: ${model_alias}"
@@ -473,12 +579,13 @@ cmd_start_llama() {
     if [[ -n "${vision_mode}" ]]; then
         log "Mode       : ${GREEN}VISION (multimodal)${RESET}"
         log "MM proj    : ${resolved_mmproj}"
-        log "Context    : ${LLAMA_VISION_CTX_SIZE:-${LLAMA_CTX_SIZE}}"
-        log "Parallel   : ${LLAMA_VISION_PARALLEL:-1}"
+        log "Context    : ${RUNTIME_CTX_SIZE}"
+        log "Parallel   : ${RUNTIME_PARALLEL}"
     else
+        require_dgx_config
         log "Mode       : text-only (RPC: ${DGX_HOST}:${DGX_RPC_PORT})"
-        log "Context    : ${ctx_size:-${LLAMA_CTX_SIZE}}"
-        log "Parallel   : ${parallel:-${LLAMA_PARALLEL}}"
+        log "Context    : ${RUNTIME_CTX_SIZE}"
+        log "Parallel   : ${RUNTIME_PARALLEL}"
     fi
 
     local llama_bin="${LLAMA_CPP_DIR}/build/bin/llama-server"
@@ -506,46 +613,45 @@ cmd_start_llama() {
         die "MM proj file not found: ${resolved_mmproj}. Download with: ./deploy.sh download --vision"
     fi
 
-    local vision_ctx="${LLAMA_VISION_CTX_SIZE:-${LLAMA_CTX_SIZE}}"
-    local vision_parallel="${LLAMA_VISION_PARALLEL:-1}"
-    local vision_batch="${LLAMA_VISION_BATCH_SIZE:-${LLAMA_BATCH_SIZE}}"
-    local vision_ubatch="${LLAMA_VISION_UBATCH_SIZE:-${LLAMA_UBATCH_SIZE}}"
-    local vision_gpu_layers="${LLAMA_VISION_N_GPU_LAYERS:-${LLAMA_N_GPU_LAYERS}}"
-    local vision_ctk="${LLAMA_VISION_CACHE_TYPE_K:-${LLAMA_CACHE_TYPE_K}}"
-    local vision_ctv="${LLAMA_VISION_CACHE_TYPE_V:-${LLAMA_CACHE_TYPE_V}}"
+    log "Profile    : ${RUNTIME_PROFILE_NAME} (${RUNTIME_PROFILE_KIND})"
+    log "Sampling   : temp=${RUNTIME_TEMP} top_p=${RUNTIME_TOP_P} top_k=${RUNTIME_TOP_K} min_p=${RUNTIME_MIN_P}"
+    log "Penalties  : repeat=${RUNTIME_REPEAT_PENALTY} presence=${RUNTIME_PRESENCE_PENALTY}"
 
     log "Launching llama-server..."
     local -a llama_flags=(
         --model            "${resolved_model}"
         --alias            "${model_alias}"
         --jinja
-        --reasoning-format auto
-        --temp             "${LLAMA_TEMP}"
-        --top-p            "${LLAMA_TOP_P}"
-        --top-k            "${LLAMA_TOP_K}"
-        --min-p            "${LLAMA_MIN_P}"
-        --repeat-penalty   "${LLAMA_REPEAT_PENALTY}"
-        --presence-penalty "${LLAMA_PRESENCE_PENALTY}"
-        --ctx-size         "${vision_ctx}"
+        --temp             "${RUNTIME_TEMP}"
+        --top-p            "${RUNTIME_TOP_P}"
+        --top-k            "${RUNTIME_TOP_K}"
+        --min-p            "${RUNTIME_MIN_P}"
+        --repeat-penalty   "${RUNTIME_REPEAT_PENALTY}"
+        --presence-penalty "${RUNTIME_PRESENCE_PENALTY}"
+        --ctx-size         "${RUNTIME_CTX_SIZE}"
         --host             "${LLAMA_HOST}"
         --port             "${LLAMA_PORT}"
         --prio             "${LLAMA_PRIO}"
-        --parallel         "${vision_parallel}"
+        --parallel         "${RUNTIME_PARALLEL}"
         --threads          "${LLAMA_THREADS}"
         --threads-batch    "${LLAMA_THREADS_BATCH}"
-        --batch-size       "${vision_batch}"
-        --ubatch-size      "${vision_ubatch}"
-        --n-gpu-layers     "${vision_gpu_layers}"
+        --batch-size       "${RUNTIME_BATCH_SIZE}"
+        --ubatch-size      "${RUNTIME_UBATCH_SIZE}"
+        --n-gpu-layers     "${RUNTIME_N_GPU_LAYERS}"
         --mmap
         --mlock
         --kv-offload
         --kv-unified
         --flash-attn       "${LLAMA_FLASH_ATTN}"
-        --cache-type-k     "${vision_ctk}"
-        --cache-type-v     "${vision_ctv}"
+        --cache-type-k     "${RUNTIME_CACHE_TYPE_K}"
+        --cache-type-v     "${RUNTIME_CACHE_TYPE_V}"
         --perf
         --metrics
     )
+
+    if [[ -n "${RUNTIME_REASONING_FORMAT}" ]]; then
+        llama_flags+=(--reasoning-format "${RUNTIME_REASONING_FORMAT}")
+    fi
 
     if [[ -n "${vision_mode}" ]]; then
         llama_flags+=(
