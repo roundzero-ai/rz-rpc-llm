@@ -3,3 +3,4 @@ llama.cpp/
 models/
 .pids/
 *.log
+__pycache__/

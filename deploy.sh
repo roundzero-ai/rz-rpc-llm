@@ -15,6 +15,8 @@
 #   stop-rpc                         Stop rpc-server on DGX
 #   start-llama [--model-file F] [--alias A] [--ctx N] [--parallel N] [--vision]
 #   stop-llama                       Stop local llama-server
+#   start-monitor-web [--port N]     Start one-port API + monitor gateway
+#   stop-monitor-web                 Stop one-port API + monitor gateway
 #   deploy  [--tag TAG] [--model-file F] [--alias A]
 #   full    [--tag TAG] [--model-file F] [--alias A]
 #                                    Full pipeline: clone→build→start
@@ -127,6 +129,11 @@ load_config() {
     if [[ -n "${HF_TOKEN_ENV:-}" ]]; then
         HF_TOKEN="${HF_TOKEN_ENV}"
     fi
+
+    LLAMA_BACKEND_HOST="${LLAMA_BACKEND_HOST:-127.0.0.1}"
+    LLAMA_BACKEND_PORT="${LLAMA_BACKEND_PORT:-8682}"
+    MONITOR_WEB_HOST="${MONITOR_WEB_HOST:-${LLAMA_HOST}}"
+    MONITOR_WEB_PORT="${MONITOR_WEB_PORT:-${LLAMA_PORT}}"
 }
 
 require_dgx_config() {
@@ -574,7 +581,8 @@ cmd_start_llama() {
     log_section "Start llama-server on Mac Studio"
     log "Model file : ${resolved_model}"
     log "Model alias: ${model_alias}"
-    log "Listening  : ${LLAMA_HOST}:${LLAMA_PORT}"
+    log "Public API : ${LLAMA_HOST}:${LLAMA_PORT}"
+    log "Backend    : ${LLAMA_BACKEND_HOST}:${LLAMA_BACKEND_PORT}"
 
     if [[ -n "${vision_mode}" ]]; then
         log "Mode       : ${GREEN}VISION (multimodal)${RESET}"
@@ -629,8 +637,8 @@ cmd_start_llama() {
         --repeat-penalty   "${RUNTIME_REPEAT_PENALTY}"
         --presence-penalty "${RUNTIME_PRESENCE_PENALTY}"
         --ctx-size         "${RUNTIME_CTX_SIZE}"
-        --host             "${LLAMA_HOST}"
-        --port             "${LLAMA_PORT}"
+        --host             "${LLAMA_BACKEND_HOST}"
+        --port             "${LLAMA_BACKEND_PORT}"
         --prio             "${LLAMA_PRIO}"
         --parallel         "${RUNTIME_PARALLEL}"
         --threads          "${LLAMA_THREADS}"
@@ -692,10 +700,13 @@ cmd_start_llama() {
     local elapsed=0
     local limit=600
     while (( elapsed < limit )); do
-        if curl -sf "http://127.0.0.1:${LLAMA_PORT}/health" &>/dev/null; then
+        if curl -sf "http://127.0.0.1:${LLAMA_BACKEND_PORT}/health" &>/dev/null; then
             echo
+            cmd_stop_monitor_web >/dev/null 2>&1 || true
+            cmd_start_monitor_web >/dev/null
             log_ok "llama-server ready in ${elapsed}s"
             log_ok "OpenAI-compatible endpoint: http://127.0.0.1:${LLAMA_PORT}/v1"
+            log_ok "Monitor UI: http://127.0.0.1:${LLAMA_PORT}/monitor"
             log_ok "Metrics: http://127.0.0.1:${LLAMA_PORT}/metrics"
             log "Log: ${log_file}"
             if [[ -n "${monitor_mode}" ]]; then
@@ -726,6 +737,7 @@ cmd_stop_llama() {
     log_section "Stop llama-server"
     load_config
     local pid_file="${PID_DIR}/llama-server.pid"
+    local stopped=0
 
     if [[ -f "${pid_file}" ]]; then
         local pid
@@ -734,6 +746,7 @@ cmd_stop_llama() {
             kill "${pid}"
             rm -f "${pid_file}"
             log_ok "llama-server (PID ${pid}) stopped"
+            stopped=1
         else
             log_warn "PID ${pid} not running, cleaning up stale PID file"
             rm -f "${pid_file}"
@@ -742,9 +755,124 @@ cmd_stop_llama() {
         # Fallback: kill by name
         if pgrep -x llama-server &>/dev/null; then
             pkill -x llama-server && log_ok "llama-server stopped (by name)"
+            stopped=1
         else
             log_warn "No llama-server process found"
         fi
+    fi
+
+    if [[ "${stopped}" == "1" ]]; then
+        cmd_stop_monitor_web >/dev/null 2>&1 || true
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Command: start-monitor-web
+# ------------------------------------------------------------------------------
+cmd_start_monitor_web() {
+    load_config
+
+    local port_override=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port|-p) port_override="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    mkdir -p "${PID_DIR}" "${LOG_DIR}"
+
+    local monitor_host="${MONITOR_WEB_HOST}"
+    local monitor_port="${port_override:-${MONITOR_WEB_PORT}}"
+    local monitor_display_host="${monitor_host}"
+    local backend_display_host="${LLAMA_BACKEND_HOST}"
+    local pid_file="${PID_DIR}/monitor-web.pid"
+    local log_file="${LOG_DIR}/monitor-web.log"
+    local app_file="${SCRIPT_DIR}/monitor_web.py"
+
+    [[ -f "${app_file}" ]] || die "monitor_web.py not found at ${app_file}"
+    [[ "${monitor_port}" != "${LLAMA_BACKEND_PORT}" ]] || die "MONITOR_WEB_PORT and LLAMA_BACKEND_PORT must differ"
+
+    if [[ -f "${pid_file}" ]]; then
+        local old_pid
+        old_pid="$(cat "${pid_file}")"
+        if kill -0 "${old_pid}" 2>/dev/null; then
+            log_warn "monitor-web already running (PID ${old_pid})"
+            log_warn "Open: http://${monitor_display_host}:${monitor_port}/monitor"
+            return 0
+        fi
+        rm -f "${pid_file}"
+    fi
+
+    if [[ "${monitor_display_host}" == "0.0.0.0" ]]; then
+        monitor_display_host="127.0.0.1"
+    fi
+    if [[ "${backend_display_host}" == "0.0.0.0" ]]; then
+        backend_display_host="127.0.0.1"
+    fi
+
+    log_section "Start Monitor Web"
+    log "Binding    : ${monitor_host}:${monitor_port}"
+    log "Endpoint   : http://${monitor_display_host}:${monitor_port}/monitor"
+
+    MONITOR_WEB_HOST="${monitor_host}" \
+    MONITOR_WEB_PORT="${monitor_port}" \
+    PID_DIR="${PID_DIR}" \
+    LOG_DIR="${LOG_DIR}" \
+    LLAMA_PORT="${LLAMA_PORT}" \
+    LLAMA_BACKEND_HOST="${LLAMA_BACKEND_HOST}" \
+    LLAMA_BACKEND_PORT="${LLAMA_BACKEND_PORT}" \
+    DGX_HOST="${DGX_HOST:-}" \
+    DGX_USER="${DGX_USER:-}" \
+    DGX_RPC_PORT="${DGX_RPC_PORT:-50052}" \
+    PUBLIC_BASE_URL="http://${monitor_display_host}:${monitor_port}" \
+    BACKEND_BASE_URL="http://${backend_display_host}:${LLAMA_BACKEND_PORT}" \
+    nohup python3 "${app_file}" --host "${monitor_host}" --port "${monitor_port}" \
+        > "${log_file}" 2>&1 &
+
+    local monitor_pid=$!
+    echo "${monitor_pid}" > "${pid_file}"
+
+    local elapsed=0
+    while (( elapsed < 20 )); do
+        if curl -sf "http://${monitor_display_host}:${monitor_port}/api/monitor" &>/dev/null; then
+            log_ok "monitor-web ready (PID ${monitor_pid})"
+            log_ok "Dashboard: http://${monitor_display_host}:${monitor_port}/monitor"
+            log "Log: ${log_file}"
+            return 0
+        fi
+        if ! kill -0 "${monitor_pid}" 2>/dev/null; then
+            log_error "monitor-web exited unexpectedly. Last log lines:"
+            tail -20 "${log_file}" >&2
+            die "monitor-web failed to start"
+        fi
+        sleep 1
+        (( elapsed += 1 ))
+    done
+
+    log_warn "monitor-web did not respond yet — check ${log_file}"
+}
+
+# ------------------------------------------------------------------------------
+# Command: stop-monitor-web
+# ------------------------------------------------------------------------------
+cmd_stop_monitor_web() {
+    load_config
+    local pid_file="${PID_DIR}/monitor-web.pid"
+
+    if [[ -f "${pid_file}" ]]; then
+        local pid
+        pid="$(cat "${pid_file}")"
+        if kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}"
+            rm -f "${pid_file}"
+            log_ok "monitor-web (PID ${pid}) stopped"
+        else
+            log_warn "monitor-web PID ${pid} not running, removing stale PID file"
+            rm -f "${pid_file}"
+        fi
+    else
+        log_warn "No monitor-web process found"
     fi
 }
 
@@ -1274,8 +1402,8 @@ cmd_status() {
         local pid
         pid="$(cat "${pid_file}")"
         if kill -0 "${pid}" 2>/dev/null; then
-            log_ok "llama-server  RUNNING  (PID ${pid}, port ${LLAMA_PORT})"
-            if curl -sf "http://127.0.0.1:${LLAMA_PORT}/health" &>/dev/null; then
+            log_ok "llama-server  RUNNING  (PID ${pid}, backend ${LLAMA_BACKEND_HOST}:${LLAMA_BACKEND_PORT})"
+            if curl -sf "http://127.0.0.1:${LLAMA_BACKEND_PORT}/health" &>/dev/null; then
                 log_ok "              health check: OK"
             else
                 log_warn "              health check: not responding yet"
@@ -1285,7 +1413,7 @@ cmd_status() {
         fi
     else
         if pgrep -x llama-server &>/dev/null; then
-            log_ok "llama-server  RUNNING  (PID $(pgrep -x llama-server | head -1), unmanaged)"
+            log_ok "llama-server  RUNNING  (PID $(pgrep -x llama-server | head -1), unmanaged backend)"
         else
             log_warn "llama-server  STOPPED"
         fi
@@ -1302,6 +1430,25 @@ cmd_status() {
         fi
     else
         log_warn "rpc-server    UNKNOWN  (DGX not reachable)"
+    fi
+
+    local monitor_pid_file="${PID_DIR}/monitor-web.pid"
+    local monitor_check_host="${MONITOR_WEB_HOST}"
+    [[ "${monitor_check_host}" == "0.0.0.0" ]] && monitor_check_host="127.0.0.1"
+    if [[ -f "${monitor_pid_file}" ]]; then
+        local monitor_pid
+        monitor_pid="$(cat "${monitor_pid_file}")"
+        if kill -0 "${monitor_pid}" 2>/dev/null; then
+            if curl -sf "http://${monitor_check_host}:${MONITOR_WEB_PORT}/api/monitor" &>/dev/null; then
+                log_ok "monitor-web   RUNNING  (PID ${monitor_pid}, http://${monitor_check_host}:${MONITOR_WEB_PORT}/monitor)"
+            else
+                log_warn "monitor-web   RUNNING  (PID ${monitor_pid}, not responding yet)"
+            fi
+        else
+            log_warn "monitor-web   STOPPED  (stale PID ${monitor_pid})"
+        fi
+    else
+        log_warn "monitor-web   STOPPED"
     fi
 }
 
@@ -1323,7 +1470,13 @@ cmd_logs() {
             log "Tailing rpc-server log on DGX (Ctrl+C to stop)"
             ssh_dgx "tail -f /tmp/rpc-server.log"
             ;;
-        *) die "Unknown log target '${target}'. Use: rpc | llama" ;;
+        monitor|monitor-web)
+            local log_file="${LOG_DIR}/monitor-web.log"
+            [[ -f "${log_file}" ]] || die "No monitor-web log at ${log_file}"
+            log "Tailing ${log_file} (Ctrl+C to stop)"
+            tail -f "${log_file}"
+            ;;
+        *) die "Unknown log target '${target}'. Use: rpc | llama | monitor" ;;
     esac
 }
 
@@ -1365,6 +1518,12 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}stop-llama${RESET}
        Stop local llama-server
 
+  ${CYAN}start-monitor-web${RESET} [--port PORT]
+       Start a colorful browser dashboard that shares the same public port as the API
+
+  ${CYAN}stop-monitor-web${RESET}
+       Stop the API + monitor gateway
+
   ${CYAN}deploy${RESET}   [--tag TAG] [--model-file PATH] [--alias NAME]
                  [--skip-clone] [--skip-build] [--skip-download]
        Full pipeline: clone → build-dgx → build-mac → download → start-rpc → start-llama
@@ -1380,7 +1539,7 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}status${RESET}
        Show running process status for both devices
 
-  ${CYAN}logs${RESET}     [llama|rpc]
+  ${CYAN}logs${RESET}     [llama|rpc|monitor]
        Tail logs (default: llama)
 
 ${BOLD}EXAMPLES${RESET}
@@ -1398,6 +1557,10 @@ ${BOLD}EXAMPLES${RESET}
   ${BOLD}# Check health${RESET}
   ./deploy.sh status
   curl http://localhost:${LLAMA_PORT:-8680}/health
+
+  ${BOLD}# Start the web monitor${RESET}
+  ./deploy.sh start-monitor-web
+  open http://127.0.0.1:${MONITOR_WEB_PORT:-8680}/monitor
 
 EOF
 }
@@ -1422,6 +1585,8 @@ main() {
         stop-rpc)    cmd_stop_rpc "$@" ;;
         start-llama) cmd_start_llama "$@" ;;
         stop-llama)  cmd_stop_llama "$@" ;;
+        start-monitor-web) cmd_start_monitor_web "$@" ;;
+        stop-monitor-web)  cmd_stop_monitor_web "$@" ;;
         deploy|full) cmd_deploy "$@" ;;
         monitor)     cmd_monitor "$@" ;;
         status)      cmd_status "$@" ;;

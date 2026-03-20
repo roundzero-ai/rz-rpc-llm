@@ -77,6 +77,7 @@ Key defaults from `defaults.env`:
 ```text
 rz-rpc-llm/
 |- deploy.sh
+|- monitor_web.py
 |- defaults.env
 |- config.env.example
 |- config.env              # optional local overrides, gitignored
@@ -160,6 +161,7 @@ This is the simplest path and works from checked-in defaults.
 ```
 
 `start-llama --vision` automatically drops into the monitor after the server becomes healthy.
+The browser monitor is available on the same public port at `http://127.0.0.1:8680/monitor`.
 
 Or, if you already have `llama.cpp` built:
 
@@ -185,6 +187,8 @@ That pipeline does:
 - start `rpc-server`
 - start local `llama-server`
 
+After startup, the OpenAI API stays on `http://127.0.0.1:8680/v1` and the browser monitor lives on `http://127.0.0.1:8680/monitor`.
+
 ## Commands
 
 `deploy.sh` is the whole interface.
@@ -207,6 +211,8 @@ That pipeline does:
 | `start-llama [--model-file F] [--alias A] [--ctx N] [--parallel N]` | Start local `llama-server` in distributed mode |
 | `start-llama --vision` | Start local `llama-server` in vision mode |
 | `stop-llama` | Stop local `llama-server` |
+| `start-monitor-web [--port P]` | Start the single-port gateway that serves both API and monitor UI |
+| `stop-monitor-web` | Stop the browser dashboard |
 | `deploy [--tag T] [--skip-clone] [--skip-build] [--skip-download]` | Full distributed pipeline |
 | `full ...` | Alias for `deploy` |
 
@@ -215,7 +221,7 @@ That pipeline does:
 | Command | Purpose |
 |---|---|
 | `status` | Show Mac and DGX process status |
-| `logs [llama|rpc]` | Tail local or remote logs |
+| `logs [llama|rpc|monitor]` | Tail local or remote logs |
 | `monitor [INTERVAL] [TABLE_WIDTH]` | Show rolling health + performance monitor |
 
 ## Recommended workflows
@@ -311,6 +317,8 @@ Once `llama-server` is up, the important endpoints are:
 | `http://127.0.0.1:8680/v1/models` | list loaded models |
 | `http://127.0.0.1:8680/health` | health check |
 | `http://127.0.0.1:8680/metrics` | Prometheus metrics |
+| `http://127.0.0.1:8680/monitor` | colorful browser monitor UI on the same port as the API |
+| `http://127.0.0.1:8680/monitor/api` | JSON snapshot + rolling history for the browser UI |
 
 ## API examples
 
@@ -353,6 +361,21 @@ curl http://127.0.0.1:8680/v1/chat/completions \
 
 `./deploy.sh monitor` renders a rolling terminal dashboard.
 
+If you want the same information in a browser, start the web monitor:
+
+```bash
+./deploy.sh start-monitor-web
+open http://127.0.0.1:8680/monitor
+```
+
+In the single-port setup, `8680` is the public gateway:
+
+- `/v1`, `/health`, and `/metrics` are proxied to the internal `llama-server` backend
+- `/monitor` and `/monitor/api` are served directly by the gateway
+- `start-llama` will also bring the gateway up so the API and monitor stay on one port
+
+By default the internal backend listens on `127.0.0.1:8682` and is not meant to be called directly.
+
 It shows:
 
 - Mac memory and GPU utilization
@@ -362,6 +385,7 @@ It shows:
 - token generation speed (`tg`)
 - active requests, prompt tokens, and generated tokens
 - a live tail of the last 5 `llama-server` log lines
+- a colorful browser dashboard with rolling history and endpoint links
 
 Example:
 
