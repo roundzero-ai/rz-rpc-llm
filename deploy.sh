@@ -134,6 +134,7 @@ load_config() {
     LLAMA_BACKEND_PORT="${LLAMA_BACKEND_PORT:-8682}"
     MONITOR_WEB_HOST="${MONITOR_WEB_HOST:-${LLAMA_HOST}}"
     MONITOR_WEB_PORT="${MONITOR_WEB_PORT:-${LLAMA_PORT}}"
+    LLAMA_DEFRAG_THOLD="${LLAMA_DEFRAG_THOLD:-0.05}"
 }
 
 require_dgx_config() {
@@ -205,6 +206,17 @@ select_runtime_profile() {
         RUNTIME_PRESENCE_PENALTY="${LLAMA_TEXT_PRESENCE_PENALTY}"
         RUNTIME_REASONING_FORMAT="${LLAMA_TEXT_REASONING_FORMAT}"
     fi
+}
+
+calculate_effective_ctx_size() {
+    local per_slot_ctx="$1"
+    local slots="$2"
+
+    [[ "${per_slot_ctx}" =~ ^[0-9]+$ ]] || die "Context size must be an integer, got: ${per_slot_ctx}"
+    [[ "${slots}" =~ ^[0-9]+$ ]] || die "Parallel slots must be an integer, got: ${slots}"
+    (( slots > 0 )) || die "Parallel slots must be greater than 0"
+
+    EFFECTIVE_CTX_SIZE=$(( per_slot_ctx * slots ))
 }
 
 # ------------------------------------------------------------------------------
@@ -577,6 +589,7 @@ cmd_start_llama() {
     fi
 
     select_runtime_profile "${vision_mode}" "${ctx_size}" "${parallel}"
+    calculate_effective_ctx_size "${RUNTIME_CTX_SIZE}" "${RUNTIME_PARALLEL}"
 
     log_section "Start llama-server on Mac Studio"
     log "Model file : ${resolved_model}"
@@ -587,13 +600,15 @@ cmd_start_llama() {
     if [[ -n "${vision_mode}" ]]; then
         log "Mode       : ${GREEN}VISION (multimodal)${RESET}"
         log "MM proj    : ${resolved_mmproj}"
-        log "Context    : ${RUNTIME_CTX_SIZE}"
-        log "Parallel   : ${RUNTIME_PARALLEL}"
+        log "Slots      : ${RUNTIME_PARALLEL}"
+        log "Ctx/slot   : ${RUNTIME_CTX_SIZE}"
+        log "Ctx total  : ${EFFECTIVE_CTX_SIZE}"
     else
         require_dgx_config
         log "Mode       : text-only (RPC: ${DGX_HOST}:${DGX_RPC_PORT})"
-        log "Context    : ${RUNTIME_CTX_SIZE}"
-        log "Parallel   : ${RUNTIME_PARALLEL}"
+        log "Slots      : ${RUNTIME_PARALLEL}"
+        log "Ctx/slot   : ${RUNTIME_CTX_SIZE}"
+        log "Ctx total  : ${EFFECTIVE_CTX_SIZE}"
     fi
 
     local llama_bin="${LLAMA_CPP_DIR}/build/bin/llama-server"
@@ -624,6 +639,7 @@ cmd_start_llama() {
     log "Profile    : ${RUNTIME_PROFILE_NAME} (${RUNTIME_PROFILE_KIND})"
     log "Sampling   : temp=${RUNTIME_TEMP} top_p=${RUNTIME_TOP_P} top_k=${RUNTIME_TOP_K} min_p=${RUNTIME_MIN_P}"
     log "Penalties  : repeat=${RUNTIME_REPEAT_PENALTY} presence=${RUNTIME_PRESENCE_PENALTY}"
+    log "Defrag     : ${LLAMA_DEFRAG_THOLD}"
 
     log "Launching llama-server..."
     local -a llama_flags=(
@@ -636,7 +652,7 @@ cmd_start_llama() {
         --min-p            "${RUNTIME_MIN_P}"
         --repeat-penalty   "${RUNTIME_REPEAT_PENALTY}"
         --presence-penalty "${RUNTIME_PRESENCE_PENALTY}"
-        --ctx-size         "${RUNTIME_CTX_SIZE}"
+        --ctx-size         "${EFFECTIVE_CTX_SIZE}"
         --host             "${LLAMA_BACKEND_HOST}"
         --port             "${LLAMA_BACKEND_PORT}"
         --prio             "${LLAMA_PRIO}"
@@ -653,6 +669,7 @@ cmd_start_llama() {
         --flash-attn       "${LLAMA_FLASH_ATTN}"
         --cache-type-k     "${RUNTIME_CACHE_TYPE_K}"
         --cache-type-v     "${RUNTIME_CACHE_TYPE_V}"
+        --defrag-thold     "${LLAMA_DEFRAG_THOLD}"
         --perf
         --metrics
     )

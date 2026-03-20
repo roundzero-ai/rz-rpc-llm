@@ -262,6 +262,7 @@ After startup, the OpenAI API stays on `http://127.0.0.1:8680/v1` and the browse
 - default file: `UD-Q6_K_XL/MiniMax-M2.5-UD-Q6_K_XL-00001-of-00005.gguf`
 - alias: `minimax-m2.5`
 - context: `131072`
+- slots: `1`
 - tensor split: `2,3`
 - KV cache: `q8_0`
 - flash attention: `on`
@@ -283,7 +284,9 @@ MiniMax defaults baked into `deploy.sh`:
 - default file: `UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00001-of-00004.gguf`
 - projector: `mmproj-BF16.gguf`
 - alias: `qwen3.5-122b-vision`
-- context: `262144`
+- context per slot: `262144`
+- slots: `4`
+- total ctx passed to `llama-server`: `1048576`
 - KV cache: `q8_0`
 - flash attention: `on`
 
