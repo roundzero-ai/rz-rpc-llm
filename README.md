@@ -1,95 +1,144 @@
 # rz-rpc-llm
 
-Deploys GGUF language models with [llama.cpp](https://github.com/ggml-org/llama.cpp) across Mac Studio and NVIDIA DGX Spark GB10.
+`rz-rpc-llm` is a small deployment wrapper around `llama.cpp` for two specific setups:
 
-Two deployment modes:
+- `MiniMax-M2.5` in distributed text-only mode across a Mac Studio and a DGX Spark GB10 via RPC
+- `Qwen3.5-122B-A10B` in vision mode on a Mac Studio alone with an `mmproj` projector
 
-| Mode | Hardware | Use Case |
-|---|---|---|
-| **Distributed** | Mac Studio + DGX Spark | Text-only, leverages both devices via RPC |
-| **Vision** | Mac Studio solo | Text + image multimodal (Qwen3.5-122B) |
+The script handles cloning `llama.cpp`, building the right binaries on each machine, downloading the expected GGUF files, starting servers, and monitoring runtime health.
 
-| Device | Role | Backend | Memory |
+## What this repo does
+
+There are two deployment modes.
+
+| Mode | Model | Hardware | Purpose |
 |---|---|---|---|
-| Mac Studio M2 Ultra | `llama-server` (coordinator + Metal) | Metal | 192GB unified |
-| NVIDIA DGX Spark GB10 | `rpc-server` (GPU offload) | CUDA SM121 | ~128GB unified |
+| `distributed` | `MiniMax-M2.5` | Mac Studio + DGX Spark GB10 | Text-only inference with RPC offload |
+| `vision` | `Qwen3.5-122B-A10B` | Mac Studio only | Multimodal text + image inference |
 
----
+The local API surface is always `llama-server` on the Mac, exposed as an OpenAI-compatible endpoint on port `8680` by default.
 
 ## Architecture
 
-### Distributed (text-only — Mac + DGX)
+### Distributed mode
 
-```
-┌─────────────────────────────┐         ┌──────────────────────────────┐
-│  Mac Studio M2 Ultra        │  RPC    │  DGX Spark GB10              │
-│                             │ (TCP)   │                              │
-│  llama-server               │◄───────►│  rpc-server                  │
-│  - Metal GPU backend        │  :50052 │  - CUDA SM121 backend        │
-│  - OpenAI-compatible API    │         │  - GPU layer offload         │
-│  - Serves on :8680          │         │                              │
-│  - Coordinates inference    │         │                              │
-└─────────────────────────────┘         └──────────────────────────────┘
-        ▲
-        │ HTTP :8680
-        │
-   Client (curl, app, etc.)
-```
+In distributed mode, the Mac runs `llama-server` and the DGX runs `rpc-server`.
 
-**Tensor split**: `LLAMA_TENSOR_SPLIT="2,3"` means 2 parts to Mac (Metal), 3 parts to DGX (CUDA).
-
-### Vision (Mac solo — no DGX required)
-
-```
-┌─────────────────────────────────────┐
-│  Mac Studio M2 Ultra                │
-│                                     │
-│  llama-server                       │
-│  - Full model on Metal GPU          │
-│  - Vision mmproj on Metal           │
-│  - 262K context window              │
-│  - OpenAI-compatible API            │
-│  - Serves on :8680                 │
-└─────────────────────────────────────┘
-        ▲
-        │ HTTP :8680
-        │
-   Client (curl, app, etc.)
+```text
+Client
+  |
+  | HTTP :8680
+  v
+Mac Studio (Metal)
+  - llama-server
+  - OpenAI-compatible API
+  - coordinates inference
+  - shares model execution over RPC
+  |
+  | RPC :50052
+  v
+DGX Spark GB10 (CUDA)
+  - rpc-server
+  - remote GPU offload target
 ```
 
----
+Key defaults from `defaults.env`:
 
-## Project Structure
+- model: `unsloth/MiniMax-M2.5-GGUF`
+- tensor split: `2,3` (Mac:DGX)
+- context: `131072`
+- sampling: `temp=1.0`, `top_p=0.95`, `top_k=40`, `min_p=0.01`
 
+### Vision mode
+
+In vision mode, everything runs locally on the Mac, including the projector.
+
+```text
+Client
+  |
+  | HTTP :8680
+  v
+Mac Studio (Metal)
+  - llama-server
+  - Qwen3.5-122B-A10B GGUF
+  - mmproj projector
+  - no DGX required
 ```
+
+Key defaults from `defaults.env`:
+
+- model: `unsloth/Qwen3.5-122B-A10B-GGUF`
+- context: `262144`
+- sampling: `temp=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`
+- split mode: `none`
+
+## Repository layout
+
+```text
 rz-rpc-llm/
-├── deploy.sh           # Main deployment script (all commands)
-├── defaults.env        # Checked-in non-secret defaults
-├── config.env.example  # Optional local override template
-├── config.env          # Optional local overrides (gitignored)
-├── .gitignore
-├── README.md
-├── llama.cpp/          # Cloned llama.cpp source (gitignored)
-├── models/             # Downloaded GGUF files (gitignored)
-├── .pids/              # PID files and SSH control sockets (gitignored)
-└── logs/               # Server logs (gitignored)
+|- deploy.sh
+|- defaults.env
+|- config.env.example
+|- config.env              # optional local overrides, gitignored
+|- README.md
+|- llama.cpp/              # cloned by deploy.sh, gitignored
+|- models/                 # downloaded GGUF files, gitignored
+|- logs/                   # runtime logs, gitignored
+`- .pids/                  # pid files and SSH control socket, gitignored
 ```
-
----
 
 ## Requirements
 
-- **Mac Studio**: macOS, Xcode CLT, cmake, python3, `huggingface-cli` (`pip install huggingface_hub`)
-- **DGX Spark GB10** (distributed mode only): Ubuntu/Linux, CUDA toolkit (nvcc, cmake), SSH server
-- **Network**: Both devices on the same LAN; DGX port 50052 open to Mac
-- **SSH**: Password or key-based auth to DGX (ControlMaster is used — password prompted once per session)
-- **Hugging Face**: Account + token for gated models
+### Mac Studio
 
----
+- macOS
+- Xcode Command Line Tools
+- `cmake`
+- `python3`
+- `huggingface-cli` from `huggingface_hub`
 
-## Quick Start
+### DGX Spark GB10
 
-### 1. Clone this repo
+Distributed mode also needs:
+
+- SSH access from the Mac
+- CUDA toolchain and `cmake`
+- port `50052` reachable from the Mac
+
+### Hugging Face
+
+For gated model downloads, export a token in your shell:
+
+```bash
+export HF_TOKEN="hf_..."
+```
+
+Do not store tokens in repo config files.
+
+## Configuration model
+
+This repo now uses two layers of configuration:
+
+- `defaults.env`: checked-in, non-secret defaults that make the repo runnable after clone
+- `config.env`: optional local overrides, gitignored
+
+If you need machine-specific settings, start from the template:
+
+```bash
+cp config.env.example config.env
+```
+
+Typical overrides:
+
+```bash
+DGX_HOST="192.168.86.242"
+DGX_USER="your_user"
+DGX_REMOTE_DIR="/home/your_user/rz-rpc-llm/llama.cpp"
+```
+
+## Quick start
+
+### 1. Clone the repo
 
 ```bash
 git clone https://github.com/roundzero-ai/rz-rpc-llm.git
@@ -97,290 +146,121 @@ cd rz-rpc-llm
 chmod +x deploy.sh
 ```
 
-### 2. Configure (optional)
+### 2. Pick a mode
+
+#### Vision mode
+
+This is the simplest path and works from checked-in defaults.
 
 ```bash
-# Vision mode can run directly from checked-in defaults.
-# Only create config.env if you want local overrides.
-cp config.env.example config.env
-```
-
-Common local overrides:
-
-```bash
-DGX_HOST="192.168.86.242"    # DGX IP address (distributed mode)
-DGX_USER="your_user"         # SSH username on DGX
-```
-
-For gated Hugging Face downloads, set your token in the shell instead of any project file:
-
-```bash
-export HF_TOKEN="hf_..."
-```
-
-### 3. Choose your deployment mode
-
-#### Vision mode (Mac solo — recommended for agents + coding)
-
-```bash
-# Download Qwen3.5-122B model + vision projector (~122GB total)
+./deploy.sh clone
+./deploy.sh build-mac
 ./deploy.sh download --vision
-
-# Start vision server
 ./deploy.sh start-llama --vision
 ```
 
-#### Distributed mode (Mac + DGX — text-only)
+`start-llama --vision` automatically drops into the monitor after the server becomes healthy.
+
+Or, if you already have `llama.cpp` built:
 
 ```bash
-# Full pipeline: clone → build → download → start
+./deploy.sh download --vision
+./deploy.sh start-llama --vision
+```
+
+#### Distributed mode
+
+Set your DGX overrides first if the defaults do not match your box, then run:
+
+```bash
 ./deploy.sh deploy --tag b8223
 ```
 
----
+That pipeline does:
 
-## Deployment Modes
-
-### Vision Mode (Qwen3.5-122B — Multimodal)
-
-Runs **Qwen3.5-122B-A10B** with vision encoder on Mac Studio alone. No DGX required.
-
-**Capabilities:**
-- Text + image understanding
-- Native 262K context window
-- Thinking/reasoning mode (default) for complex tasks
-- Agentic tool calling
-- 201 language support
-
-**System requirements (Mac Studio M2 Ultra 192GB):**
-- ~105GB for UD-Q6_K_XL model weights
-- ~0.9GB for mmproj-BF16 vision projector
-- ~25GB for 262K KV cache (q8_0)
-- **Total ~130GB — fits comfortably in 192GB**
-
-**Download:**
-```bash
-./deploy.sh download --vision
-# Downloads: Qwen3.5-122B-A10B UD-Q6_K_XL (4-part) + mmproj*.gguf files
-```
-
-**Start:**
-```bash
-./deploy.sh start-llama --vision
-```
-
-**Parameters (optimized for 192GB Mac Studio):**
-- Context: 262,144 tokens (native max)
-- Batch: 2048 / Ubatch: 512
-- KV cache: q8_0 quantization
-- Flash Attention: on
-- Split mode: none (single device)
-
-#### Distributed Mode (MiniMax-M2.5 — Text-only)
-
-Splits MiniMax-M2.5 across Mac Studio + DGX Spark via RPC. Best for pure text inference when both devices are available.
-
-**Start:**
-```bash
-./deploy.sh deploy
-```
-
-**Parameters:**
-- Context: 131,072 tokens
-- Tensor split: 2:3 (Mac:DGX)
-- KV cache: q8_0 quantization
-- Sampling: temp 1.0 / top_p 0.95 / top_k 40 / min_p 0.01
-
----
+- clone `llama.cpp`
+- build on DGX
+- build on Mac
+- download the default MiniMax model
+- start `rpc-server`
+- start local `llama-server`
 
 ## Commands
 
-```
+`deploy.sh` is the whole interface.
+
+```bash
 ./deploy.sh <command> [options]
 ```
 
-| Command | Description |
-|---|---|
-| `clone [--tag TAG]` | Clone llama.cpp (default: HEAD) |
-| `build-dgx` | Rsync source to DGX and build with CUDA |
-| `build-mac` | Build locally on Mac with Metal |
-| `download [--repo R] [--pattern P] [--dir D] [--vision]` | Download GGUF model |
-| `download --vision` | Download Qwen3.5-122B + mmproj for multimodal |
-| `start-rpc` | Start rpc-server on DGX via SSH |
-| `stop-rpc` | Stop rpc-server on DGX |
-| `start-llama [--model-file F] [--alias A] [--ctx N] [--parallel N] [--vision]` | Start llama-server |
-| `start-llama --vision` | Start with Qwen3.5 vision defaults (Mac solo, --mmproj, 262K ctx) |
-| `stop-llama` | Stop local llama-server |
-| `deploy [--tag T] [--skip-clone] [--skip-build] [--skip-download]` | Full pipeline (distributed mode) |
-| `monitor [INTERVAL]` | Rolling table heartbeat monitor (default 30s) |
-| `status` | Show running process status |
-| `logs [llama\|rpc]` | Tail server logs (default: llama) |
+### Lifecycle commands
 
-### Examples
+| Command | Purpose |
+|---|---|
+| `clone [--tag TAG]` | Clone `llama.cpp`, optionally checkout a tag or `latest` |
+| `build-dgx` | Sync `llama.cpp` to the DGX and build `rpc-server` |
+| `build-mac` | Build local `llama-server` with Metal |
+| `download [--repo R] [--pattern P] [--dir D]` | Download the default text model or a custom GGUF pattern |
+| `download --vision` | Download the Qwen vision model and `mmproj` |
+| `start-rpc` | Start `rpc-server` on the DGX |
+| `stop-rpc` | Stop `rpc-server` on the DGX |
+| `start-llama [--model-file F] [--alias A] [--ctx N] [--parallel N]` | Start local `llama-server` in distributed mode |
+| `start-llama --vision` | Start local `llama-server` in vision mode |
+| `stop-llama` | Stop local `llama-server` |
+| `deploy [--tag T] [--skip-clone] [--skip-build] [--skip-download]` | Full distributed pipeline |
+| `full ...` | Alias for `deploy` |
+
+### Observability commands
+
+| Command | Purpose |
+|---|---|
+| `status` | Show Mac and DGX process status |
+| `logs [llama|rpc]` | Tail local or remote logs |
+| `monitor [INTERVAL] [TABLE_WIDTH]` | Show rolling health + performance monitor |
+
+## Recommended workflows
+
+### Vision workflow
 
 ```bash
-# --- Vision mode (Qwen3.5-122B, Mac solo) ---
-./deploy.sh download --vision          # Download model + mmproj
-./deploy.sh start-llama --vision       # Start vision server
-./deploy.sh stop-llama                 # Stop vision server
-
-# --- Distributed mode (Mac + DGX) ---
-./deploy.sh deploy --tag b8223         # Full pipeline
-./deploy.sh deploy --skip-download     # Rebuild, keep model
-
-# --- Individual steps ---
-./deploy.sh start-rpc                  # Start DGX RPC server
-./deploy.sh start-llama                # Start llama-server (distributed)
-
-# --- Monitoring ---
-./deploy.sh monitor 15                 # 15-second heartbeat
+./deploy.sh clone
+./deploy.sh build-mac
+./deploy.sh download --vision
+./deploy.sh start-llama --vision
 ./deploy.sh status
-./deploy.sh logs llama
 ```
 
----
+### Distributed workflow
 
-## Monitor (Rolling Table)
-
-`./deploy.sh monitor [INTERVAL]` displays a live rolling table that overwrites in place.
-
-```
-                    │ 12:30:00  │ 12:30:30  │ 12:31:00  │ 12:31:30  │
-────────────────────┼───────────┼───────────┼───────────┼───────────┤
-Mac memory          │  85G/44%  │  85G/44%  │  84G/44%  │  85G/44%  │
-Mac GPU             │       23%  │       18%  │       45%  │       12%  │
-DGX memory          │  12G/15%  │  12G/15%  │  12G/16%  │  12G/15%  │
-DGX GPU             │   67%/UMA │   72%/UMA │   55%/UMA │   60%/UMA │
-rpc-server          │        UP │        UP │        UP │        UP │
-llama-server        │        UP │        UP │        UP │        UP │
-pp (t/s)            │     331.9 │     328.5 │     335.1 │     330.0 │
-tg (t/s)            │      19.9 │      20.0 │      19.9 │      20.0 │
-reqs processing     │         2  │         1  │         3  │         2  │
-prompt tokens       │      1.5K  │      2.1K  │      3.2K  │      4.5K  │
-gen tokens          │      3.5K  │      4.2K  │      5.8K  │      7.1K  │
-────────────────────┴───────────┴───────────┴───────────┴───────────┘
+```bash
+./deploy.sh clone --tag b8223
+./deploy.sh build-dgx
+./deploy.sh build-mac
+./deploy.sh download
+./deploy.sh start-rpc
+./deploy.sh start-llama
+./deploy.sh monitor 30
 ```
 
-**Metrics collected per heartbeat:**
+### Rebuild without re-downloading
 
-| Row | Source | Description |
-|---|---|---|
-| Mac memory | `vm_stat` + `sysctl hw.memsize` | Used/total RAM as percentage |
-| Mac GPU | `ioreg IOAccelerator` | GPU Device Utilization % (no sudo) |
-| DGX memory | `free -m` via SSH | Used/total RAM as percentage |
-| DGX GPU | `nvidia-smi` via SSH | GPU utilization % + VRAM (or "UMA" for unified memory) |
-| rpc-server | `pgrep` via SSH | Process running status |
-| llama-server | `curl /health` | HTTP health check |
-| pp (t/s) | `/metrics` `llamacpp:prompt_tokens_seconds` | Prompt processing throughput |
-| tg (t/s) | `/metrics` `llamacpp:predicted_tokens_seconds` | Token generation throughput |
-| reqs processing | `/metrics` `llamacpp:requests_processing` | Currently in-flight requests |
-| prompt tokens | `/metrics` `llamacpp:prompt_tokens_total` | Cumulative prompt tokens |
-| gen tokens | `/metrics` `llamacpp:tokens_predicted_total` | Cumulative generated tokens |
+```bash
+./deploy.sh deploy --skip-download
+```
 
-**Design notes:**
-- All DGX stats are collected in a **single SSH call** per heartbeat to minimize latency.
-- Mac memory uses `vm_stat` (instant) rather than `memory_pressure` (slow, ~1-2s).
-- Ctrl+C gracefully stops both servers before exiting.
+## Models and runtime defaults
 
----
+### Distributed text deployment
 
-## Configuration Reference (`defaults.env` + optional `config.env`)
+- model repo: `unsloth/MiniMax-M2.5-GGUF`
+- default file: `UD-Q6_K_XL/MiniMax-M2.5-UD-Q6_K_XL-00001-of-00005.gguf`
+- alias: `minimax-m2.5`
+- context: `131072`
+- tensor split: `2,3`
+- KV cache: `q8_0`
+- flash attention: `on`
 
-### Connection
-
-| Variable | Default | Description |
-|---|---|---|
-| `DGX_HOST` | `192.168.86.242` | DGX Spark IP address |
-| `DGX_USER` | `user` | SSH username on DGX |
-| `DGX_REMOTE_DIR` | `/home/user/rz-rpc-llm/llama.cpp` | Remote path for rsync + build |
-| `DGX_RPC_PORT` | `50052` | rpc-server listen port |
-| `DGX_RPC_BIND` | `0.0.0.0` | rpc-server bind address |
-
-### Local Paths
-
-| Variable | Default | Description |
-|---|---|---|
-| `LLAMA_CPP_DIR` | `./llama.cpp` | Local llama.cpp clone |
-| `MODELS_DIR` | `./models` | Model download directory |
-| `LLAMA_HOST` | `0.0.0.0` | llama-server bind address |
-| `LLAMA_PORT` | `8680` | llama-server listen port |
-
-### Vision Model (Qwen3.5-122B)
-
-| Variable | Default | Description |
-|---|---|---|
-| `DEFAULT_VISION_REPO` | `unsloth/Qwen3.5-122B-A10B-GGUF` | HuggingFace repo |
-| `DEFAULT_VISION_MODEL_PATTERN` | `*UD-Q6_K_XL*` | GGUF glob for vision downloads |
-| `DEFAULT_VISION_MODEL_FILE` | `UD-Q6_K_XL/...-00001-of-00004.gguf` | GGUF file (first shard) |
-| `DEFAULT_VISION_MM_PROJ` | `mmproj-BF16.gguf` | Vision projector file |
-| `DEFAULT_VISION_ALIAS` | `qwen3.5-122b-vision` | Model alias for API |
-| `DEFAULT_MM_PROJ_PATTERN` | `mmproj*.gguf` | Glob for mmproj download |
-
-### Inference Parameters
-
-| Variable | Default | Description |
-|---|---|---|
-| `LLAMA_CTX_SIZE` | `131072` | Context window size |
-| `LLAMA_PARALLEL` | `1` | Parallel request slots |
-| `LLAMA_THREADS` | `14` | CPU threads for inference |
-| `LLAMA_THREADS_BATCH` | `14` | CPU threads for batch processing |
-| `LLAMA_BATCH_SIZE` | `2048` | Logical batch size |
-| `LLAMA_UBATCH_SIZE` | `512` | Physical micro-batch size |
-| `LLAMA_N_GPU_LAYERS` | `all` | Layers offloaded to GPU |
-| `LLAMA_TENSOR_SPLIT` | `2,3` | Layer split ratio (Mac:DGX) |
-| `LLAMA_SPLIT_MODE` | `layer` | Split mode |
-| `LLAMA_PRIO` | `3` | Process priority (0-3) |
-| `LLAMA_FLASH_ATTN` | `on` | Flash attention |
-| `LLAMA_CACHE_TYPE_K` | `q8_0` | KV cache type for keys |
-| `LLAMA_CACHE_TYPE_V` | `q8_0` | KV cache type for values |
-| `LLAMA_CACHE_PROMPT` | `1` | Enable prompt caching across requests |
-| `LLAMA_CACHE_RAM` | `0` | Prompt cache RAM cap in MiB |
-| `LLAMA_CACHE_REUSE` | `64` | Cache reuse window |
-| `LLAMA_CONT_BATCHING` | `1` | Enable continuous batching |
-| `LLAMA_NO_CONTEXT_SHIFT` | `0` | Disable context shifting |
-
-### Vision-Specific Parameters
-
-| Variable | Default | Description |
-|---|---|---|
-| `LLAMA_VISION_CTX_SIZE` | `262144` | Vision model context (262K native) |
-| `LLAMA_VISION_PARALLEL` | `1` | Parallel slots for vision |
-| `LLAMA_VISION_BATCH_SIZE` | `2048` | Vision batch size |
-| `LLAMA_VISION_UBATCH_SIZE` | `512` | Vision micro-batch size |
-| `LLAMA_VISION_N_GPU_LAYERS` | `all` | GPU layers for vision |
-| `LLAMA_VISION_SPLIT_MODE` | `none` | No split (single device) |
-
-### Sampling Parameters
-
-| Variable | Default | Description |
-|---|---|---|
-| `LLAMA_TEXT_TEMP` | `1.0` | MiniMax default temperature |
-| `LLAMA_TEXT_TOP_P` | `0.95` | MiniMax default top-p |
-| `LLAMA_TEXT_TOP_K` | `40` | MiniMax default top-k |
-| `LLAMA_TEXT_MIN_P` | `0.01` | MiniMax default min-p |
-| `LLAMA_TEXT_REPEAT_PENALTY` | `1.0` | MiniMax repetition penalty |
-| `LLAMA_TEXT_PRESENCE_PENALTY` | `0.0` | MiniMax presence penalty |
-| `LLAMA_TEMP` | `1.0` | Temperature (general reasoning) |
-| `LLAMA_TOP_P` | `0.95` | Top-p sampling |
-| `LLAMA_TOP_K` | `20` | Top-k sampling |
-| `LLAMA_MIN_P` | `0.0` | Min-p sampling |
-| `LLAMA_REPEAT_PENALTY` | `1.0` | Repetition penalty |
-| `LLAMA_PRESENCE_PENALTY` | `1.5` | Presence penalty |
-| `LLAMA_FREQUENCY_PENALTY` | `0.0` | Frequency penalty |
-| `LLAMA_TEMP_CODING` | `0.6` | Temperature for coding |
-| `LLAMA_TOP_P_CODING` | `0.95` | Top-p for coding |
-| `LLAMA_TOP_K_CODING` | `20` | Top-k for coding |
-| `LLAMA_PRESENCE_PENALTY_CODING` | `0.0` | Coding presence penalty |
-| `LLAMA_TEMP_INSTRUCT` | `0.7` | Temperature for instruct/non-thinking |
-| `LLAMA_TOP_P_INSTRUCT` | `0.8` | Top-p for instruct mode |
-| `LLAMA_TOP_K_INSTRUCT` | `20` | Top-k for instruct mode |
-| `LLAMA_PRESENCE_PENALTY_INSTRUCT` | `1.5` | Instruct presence penalty |
-
----
-
-## MiniMax-M2.5 Sampling Guide
-
-Distributed mode uses MiniMax-M2.5 defaults from Unsloth's llama.cpp guide:
+MiniMax defaults baked into `deploy.sh`:
 
 | Setting | Value |
 |---|---|
@@ -391,60 +271,52 @@ Distributed mode uses MiniMax-M2.5 defaults from Unsloth's llama.cpp guide:
 | `repeat_penalty` | `1.0` |
 | `presence_penalty` | `0.0` |
 
-These are baked into `./deploy.sh start-llama` for distributed mode unless you override them in `config.env` with the `LLAMA_TEXT_*` variables.
+### Vision deployment
 
----
+- model repo: `unsloth/Qwen3.5-122B-A10B-GGUF`
+- default file: `UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00001-of-00004.gguf`
+- projector: `mmproj-BF16.gguf`
+- alias: `qwen3.5-122b-vision`
+- context: `262144`
+- KV cache: `q8_0`
+- flash attention: `on`
 
-## Qwen3.5-122B Sampling Guide
+Qwen defaults baked into `deploy.sh`:
 
-Qwen3.5 supports **thinking mode** (default) — the model generates `<thinking>` content before the final response. Use different sampling parameters based on use case:
+| Use case | temp | top_p | top_k | min_p | presence_penalty |
+|---|---:|---:|---:|---:|---:|
+| general reasoning | 1.0 | 0.95 | 20 | 0.0 | 1.5 |
+| coding | 0.6 | 0.95 | 20 | 0.0 | 0.0 |
+| direct / non-thinking | 0.7 | 0.8 | 20 | 0.0 | 1.5 |
 
-| Mode | temp | top_p | top_k | presence_penalty | Use Case |
-|---|---|---|---|---|---|
-| **General reasoning** | 1.0 | 0.95 | 20 | 1.5 | Math, analysis, complex tasks |
-| **Coding** | 0.6 | 0.95 | 20 | 0.0 | Precise code generation |
-| **Instruct** (no thinking) | 0.7 | 0.8 | 20 | 1.5 | Direct Q&A, summaries |
+To disable Qwen thinking mode in API requests:
 
-**Recommended output length:** 32,768 tokens for most queries; 81,920 for math/programming benchmarks.
-
-**Disable thinking** (get direct answers):
 ```json
 {
   "extra_body": {
-    "chat_template_kwargs": {"enable_thinking": false}
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
   }
 }
 ```
 
----
+## API endpoints
 
-## Endpoints
+Once `llama-server` is up, the important endpoints are:
 
-| Endpoint | Description |
+| Endpoint | Purpose |
 |---|---|
-| `http://localhost:8680/v1` | OpenAI-compatible API |
-| `http://localhost:8680/v1/models` | List loaded models |
-| `http://localhost:8680/health` | Health check |
-| `http://localhost:8680/metrics` | Prometheus metrics |
+| `http://127.0.0.1:8680/v1` | OpenAI-compatible API |
+| `http://127.0.0.1:8680/v1/models` | list loaded models |
+| `http://127.0.0.1:8680/health` | health check |
+| `http://127.0.0.1:8680/metrics` | Prometheus metrics |
 
-### Key Prometheus Metrics
+## API examples
 
-| Metric | Type | Description |
-|---|---|---|
-| `llamacpp:prompt_tokens_seconds` | gauge | Prompt processing speed (tokens/s) |
-| `llamacpp:predicted_tokens_seconds` | gauge | Token generation speed (tokens/s) |
-| `llamacpp:prompt_tokens_total` | counter | Total prompt tokens processed |
-| `llamacpp:tokens_predicted_total` | counter | Total tokens generated |
-| `llamacpp:requests_processing` | gauge | Currently processing requests |
-
----
-
-## API Usage Examples
-
-### Vision (Qwen3.5-122B)
+### Vision request with an image
 
 ```bash
-# Image understanding
 curl http://127.0.0.1:8680/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -458,111 +330,135 @@ curl http://127.0.0.1:8680/v1/chat/completions \
     "top_p": 0.95,
     "extra_body": {"top_k": 20}
   }'
+```
 
-# Coding with thinking
+### Text request in distributed mode
+
+```bash
 curl http://127.0.0.1:8680/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.5-122b-vision",
-    "messages": [{"role": "user", "content": "Write a Python async context manager for database connections"}],
-    "max_tokens": 8192,
-    "temperature": 0.6,
+    "model": "minimax-m2.5",
+    "messages": [
+      {"role": "user", "content": "Summarize the main tradeoffs of RPC-based model split inference."}
+    ],
+    "max_tokens": 2048,
+    "temperature": 1.0,
     "top_p": 0.95,
-    "extra_body": {"top_k": 20, "presence_penalty": 0.0}
-  }'
-
-# Disable thinking (instruct mode)
-curl http://127.0.0.1:8680/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.5-122b-vision",
-    "messages": [{"role": "user", "content": "What is 2+2?"}],
-    "max_tokens": 256,
-    "temperature": 0.7,
-    "top_p": 0.8,
-    "extra_body": {
-      "top_k": 20,
-      "chat_template_kwargs": {"enable_thinking": false}
-    }
+    "extra_body": {"top_k": 40, "min_p": 0.01}
   }'
 ```
 
----
+## Monitor
 
-## SSH Details (Distributed Mode)
+`./deploy.sh monitor` renders a rolling terminal dashboard.
 
-The script uses SSH ControlMaster to avoid repeated password prompts:
+It shows:
 
-- Control socket: `.pids/ssh-dgx.ctl`
-- `ControlPersist=600` (10 minutes)
-- All SSH and rsync calls reuse the same master connection
-- The `build-dgx` command uses `bash -l` (login shell) on DGX because non-interactive SSH does not source `.bashrc`/`.profile`
+- Mac memory and GPU utilization
+- DGX memory and GPU utilization in distributed mode
+- `rpc-server` and `llama-server` health
+- prompt processing speed (`pp`)
+- token generation speed (`tg`)
+- active requests, prompt tokens, and generated tokens
+- a live tail of the last 5 `llama-server` log lines
 
----
-
-## Build Details
-
-### DGX Build (CUDA)
-
-```bash
-cmake -B build \
-    -DGGML_CUDA=ON \
-    -DGGML_CUDA_FA_ALL_QUANTS=ON \
-    -DCMAKE_CUDA_ARCHITECTURES="121" \
-    -DGGML_CPU_AARCH64=ON \
-    -DBUILD_SHARED_LIBS=OFF \
-    -DGGML_RPC=ON \
-    -DCMAKE_BUILD_TYPE=Release
-```
-
-- SM121 = Blackwell GB10 architecture
-- Static linking
-- `rpc-server` binary location varies by llama.cpp version — the script locates it dynamically with `find`
-
-### Mac Build (Metal)
+Example:
 
 ```bash
-cmake -B build \
-    -DGGML_METAL=ON \
-    -DBUILD_SHARED_LIBS=OFF \
-    -DGGML_RPC=ON \
-    -DCMAKE_BUILD_TYPE=Release
+./deploy.sh monitor 15
 ```
 
----
+Notes:
+
+- `Ctrl+C` from the monitor stops `llama-server`
+- `start-llama --vision` automatically enters the monitor after startup
+- DGX stats are collected with a single SSH call per heartbeat
+- the live log section now shows the last 5 lines only
+
+## Build details
+
+### DGX build
+
+`build-dgx` syncs the local `llama.cpp` tree to `DGX_REMOTE_DIR` and builds `rpc-server` remotely with CUDA and RPC enabled.
+
+Important flags in the remote build:
+
+- `-DGGML_CUDA=ON`
+- `-DGGML_CUDA_FA_ALL_QUANTS=ON`
+- `-DCMAKE_CUDA_ARCHITECTURES="121"`
+- `-DGGML_RPC=ON`
+- `-DLLAMA_FLASH_ATTENTION=ON`
+
+### Mac build
+
+`build-mac` builds `llama-server` locally with:
+
+- `-DGGML_METAL=ON`
+- `-DGGML_RPC=ON`
+- `-DCMAKE_BUILD_TYPE=Release`
+
+## SSH behavior
+
+Distributed mode uses SSH ControlMaster so you do not get repeatedly prompted for credentials.
+
+- control socket: `.pids/ssh-dgx.ctl`
+- control persist: 10 minutes
+- `rsync` and `ssh` reuse the same control connection
+- remote builds run in `bash -l` so DGX toolchain paths are available
 
 ## Troubleshooting
 
-**llama-server exits immediately:**
+### `llama-server` exits during startup
+
+Check:
+
 ```bash
 ./deploy.sh logs llama
 ```
+
 Common causes:
-- Model file path wrong (check `DEFAULT_MODEL_FILE` in `defaults.env` or your `config.env` override)
-- Not enough RAM — model + KV cache must fit in memory
-- rpc-server not running (for distributed mode)
-- llama.cpp version mismatch between Mac and DGX builds
 
-**Health check never succeeds (timeout after 10 min):**
-- Large models (>100GB) can take several minutes to load
-- Check `logs/llama-server.log` for progress
-- Ensure enough free memory
+- wrong `DEFAULT_MODEL_FILE` or `DEFAULT_VISION_MODEL_FILE`
+- missing `mmproj` in vision mode
+- not enough free RAM for weights plus KV cache
+- `rpc-server` not running for distributed mode
+- Mac and DGX built from mismatched `llama.cpp` versions
 
-**HF download fails:**
-- Export `HF_TOKEN` in your shell
-- Accept model license on huggingface.co
-- Ensure `huggingface-cli` is installed: `pip install huggingface_hub`
+### Download fails
 
-**Stale PID / lock files:**
-- `.pids/llama-server.pid` — delete if llama-server crashed
-- `.git/index.lock` — delete if git operation was interrupted
+- export `HF_TOKEN` in your shell
+- accept the model license on Hugging Face
+- verify `huggingface-cli` is installed
 
-**Distributed mode — SSH fails to DGX:**
+### DGX SSH fails
+
+Try:
+
 ```bash
-ssh-copy-id user@192.168.86.242
-ssh user@192.168.86.242 echo OK
+ssh user@your-dgx-host echo OK
 ```
 
-**Distributed mode — rpc-server not reachable:**
-- Check DGX firewall: port 50052 must be open
-- Test: `nc -z 192.168.86.242 50052`
+If needed, update `DGX_HOST`, `DGX_USER`, and `DGX_REMOTE_DIR` in `config.env`.
+
+### RPC server is not reachable
+
+- make sure port `50052` is open
+- verify the DGX host is reachable from the Mac
+- test with `nc -z <DGX_HOST> 50052`
+
+### Health check takes a long time
+
+Large models can take several minutes to mmap and initialize. Check:
+
+- `logs/llama-server.log`
+- `http://127.0.0.1:8680/health`
+- `http://127.0.0.1:8680/metrics`
+
+## File reference
+
+The most important files are:
+
+- `deploy.sh`: the deployment entrypoint and runtime orchestration
+- `defaults.env`: checked-in model, hardware, and runtime defaults
+- `config.env.example`: optional local override template
