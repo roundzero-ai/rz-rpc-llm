@@ -369,6 +369,33 @@ Example:
 ./deploy.sh monitor 15
 ```
 
+Developer-focused UX example:
+
+```text
+                    | 12:30:00 | 12:30:15 | 12:30:30 | 12:30:45 |
+--------------------+----------+----------+----------+----------+
+Mac RAM used        |  85G/44% |  86G/45% |  86G/45% |  87G/45% |
+Mac GPU util        |      23% |      41% |      38% |      19% |
+DGX RAM used        |  12G/15% |  12G/15% |  13G/16% |  13G/16% |
+DGX GPU util        |   67%/8G |   71%/8G |   63%/8G |   58%/8G |
+rpc-server          |       UP |       UP |       UP |       UP |
+llama-server        |       UP |       UP |       UP |       UP |
+pp (t/s)            |    331.9 |    328.5 |    335.1 |    330.0 |
+tg (t/s)            |     19.9 |     20.0 |     19.9 |     20.0 |
+reqs                |        2 |        1 |        3 |        2 |
+prompt tokens       |     1.5K |     2.1K |     3.2K |     4.5K |
+gen tokens          |     3.5K |     4.2K |     5.8K |     7.1K |
+
+⚡ live @ 12:30:45 --- llama-server log (last 5 lines) ---
+srv  update_slots: all slots are idle
+srv  request: POST /v1/chat/completions 127.0.0.1 200
+slot 0: prompt eval time = 3.01 s / 998 tokens
+slot 0: generation eval time = 21.44 s / 428 tokens
+metrics: prompt=331.9 t/s, generation=20.0 t/s
+```
+
+This is useful when you are tuning split ratios, context size, or model choice and want one terminal view for health, throughput, and the latest server behavior.
+
 Notes:
 
 - `Ctrl+C` from the monitor stops `llama-server`
