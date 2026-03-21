@@ -404,36 +404,37 @@ INDEX_HTML = """<!doctype html>
     }
 
     function historyBuckets(history, count) {
-      const now = history.length ? history[history.length - 1].captured_at : (Date.now() / 1000);
       const formatAge = (seconds) => {
         if (seconds >= 60) return `-${Math.round(seconds / 60)}m`;
         return `-${Math.round(seconds)}s`;
       };
-      const boundaries = Array.from({ length: count + 1 }, (_, index) => {
-        const distance = (count - index) / count;
-        return HISTORY_WINDOW_SECONDS * (distance ** 2);
-      });
-      const newestFirst = [...history].reverse();
+
+      if (!history.length) {
+        return Array.from({ length: count }, (_, index) => ({
+          label: formatAge((((count - index) / count) ** 2) * HISTORY_WINDOW_SECONDS),
+          empty: true,
+        }));
+      }
+
+      const now = history[history.length - 1].captured_at;
+
+      if (history.length <= count) {
+        return history.map((entry) => ({
+          ...entry,
+          label: formatAge(Math.max(0, Math.round(now - entry.captured_at))),
+        }));
+      }
 
       return Array.from({ length: count }, (_, index) => {
-        const olderAge = boundaries[index];
-        const newerAge = boundaries[index + 1];
-        const labelAge = Math.max(0, Math.round((olderAge + newerAge) / 2));
-        const sample = newestFirst.find((entry) => {
-          const age = now - entry.captured_at;
-          const withinOlderBound = age <= olderAge || index === 0;
-          const withinNewerBound = age > newerAge || index === count - 1;
-          return withinOlderBound && withinNewerBound;
-        });
-
-        return sample || {
-          label: formatAge(labelAge),
-          empty: true,
+        const progress = count === 1 ? 1 : index / (count - 1);
+        const weighted = 1 - ((1 - progress) ** 2);
+        const sourceIndex = Math.max(0, Math.min(history.length - 1, Math.round(weighted * (history.length - 1))));
+        const entry = history[sourceIndex];
+        return {
+          ...entry,
+          label: formatAge(Math.max(0, Math.round(now - entry.captured_at))),
         };
-      }).map((bucket) => ({
-        ...bucket,
-        label: bucket.label || formatAge(Math.max(0, Math.round(now - bucket.captured_at))),
-      }));
+      });
     }
 
     function render(data) {
