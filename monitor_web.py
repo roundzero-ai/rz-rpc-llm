@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,7 +26,8 @@ DGX_HOST = os.environ.get("DGX_HOST", "")
 DGX_USER = os.environ.get("DGX_USER", "")
 DGX_RPC_PORT = os.environ.get("DGX_RPC_PORT", "50052")
 CONTROL_PATH = str(PID_DIR / "ssh-dgx.ctl")
-HISTORY = deque(maxlen=32)
+HISTORY = deque(maxlen=512)
+HISTORY_WINDOW_SECONDS = 20 * 60
 
 
 def run(cmd, timeout=4):
@@ -103,7 +105,7 @@ def mac_ram_used():
     used_gb = (total_bytes - free_bytes) / (1024 ** 3)
     total_gb = total_bytes / (1024 ** 3)
     used_pct = int(round((used_gb / total_gb) * 100)) if total_gb else 0
-    return f"{used_gb:.0f}G/{used_pct}%"
+    return f"{used_pct}%"
 
 
 def mac_gpu_util():
@@ -149,7 +151,7 @@ def dgx_snapshot():
         used = int(mem.group(1))
         total = int(mem.group(2))
         if total > 0:
-            ram = f"{used // 1024}G/{(used * 100) // total}%"
+            ram = f"{(used * 100) // total}%"
 
     if gpu_mem and gpu_mem.group(1).strip():
         parts = [p.strip() for p in gpu_mem.group(1).split(",")]
@@ -192,10 +194,12 @@ def log_tail():
 
 
 def take_snapshot():
+    now = time.time()
     mode = detect_mode()
     dgx = dgx_snapshot()
     llama = llama_snapshot()
     snapshot = {
+        "captured_at": now,
         "timestamp": subprocess.run(["date", "+%H:%M:%S"], capture_output=True, text=True).stdout.strip(),
         "mode": mode,
         "mac_ram": mac_ram_used(),
@@ -220,6 +224,9 @@ def take_snapshot():
         },
     }
     HISTORY.append(snapshot)
+    cutoff = now - HISTORY_WINDOW_SECONDS
+    while HISTORY and HISTORY[0].get("captured_at", 0) < cutoff:
+        HISTORY.popleft()
     return snapshot
 
 
@@ -253,12 +260,15 @@ INDEX_HTML = """<!doctype html>
         linear-gradient(180deg, #09111b, #05080d 70%);
       min-height: 100vh;
     }
-    .wrap { max-width: 1440px; margin: 0 auto; padding: 24px; }
+    .wrap { max-width: 1500px; margin: 0 auto; padding: 24px; }
     .hero {
-      display: grid; gap: 16px; margin-bottom: 18px; padding: 20px 22px;
+      display: grid; gap: 18px; margin-bottom: 18px; padding: 20px 22px;
+      grid-template-columns: 1fr;
+      align-items: start;
       background: linear-gradient(135deg, rgba(16,28,45,0.9), rgba(8,14,23,0.84));
       border: 1px solid var(--line); border-radius: 22px; box-shadow: var(--shadow);
     }
+    .hero-main { display: grid; gap: 16px; }
     .hero h1 { margin: 0; font-size: clamp(24px, 4vw, 40px); }
     .hero p { margin: 0; color: var(--muted); max-width: 72ch; }
     .meta, .cards { display: grid; gap: 14px; }
@@ -281,55 +291,79 @@ INDEX_HTML = """<!doctype html>
     .dot.good { background: var(--good); box-shadow: 0 0 18px rgba(47,210,127,0.7); }
     .dot.warn { background: var(--warn); box-shadow: 0 0 18px rgba(255,189,69,0.6); }
     .dot.bad { background: var(--bad); box-shadow: 0 0 18px rgba(255,107,107,0.65); }
-    .grid-2 { display: grid; gap: 16px; grid-template-columns: minmax(0, 2.2fr) minmax(320px, 1fr); }
     .panel h2 { margin: 0 0 12px; font-size: 15px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 10px 8px; border-bottom: 1px solid rgba(255,255,255,0.06); text-align: right; }
-    th:first-child, td:first-child { text-align: left; position: sticky; left: 0; background: rgba(12,19,30,0.96); }
+    .panel.edge { padding-left: 0; padding-right: 0; overflow: hidden; }
+    .panel.edge h2, .panel.edge .history-note { padding-left: 16px; padding-right: 16px; }
+    .history-note { margin: -4px 0 10px; color: var(--muted); font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: fixed; }
+    th, td { padding: 9px 6px; border-bottom: 1px solid rgba(255,255,255,0.06); text-align: right; }
+    th:first-child, td:first-child {
+      width: 154px; min-width: 154px; text-align: left; position: sticky; left: 0;
+      background: rgba(12,19,30,0.98); z-index: 1;
+    }
     thead th { color: var(--muted); font-weight: 600; }
-    .history { overflow-x: auto; }
+    .history {
+      width: 100%; overflow: hidden; border-top: 1px solid rgba(255,255,255,0.06);
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
     .log {
       margin: 0; padding: 14px; min-height: 250px; border-radius: 14px; overflow: auto;
       background: linear-gradient(180deg, rgba(5,8,14,0.95), rgba(8,11,18,0.95));
       border: 1px solid rgba(255,255,255,0.06); color: #d7f5e7; line-height: 1.55;
     }
     .endpoint-list { display: grid; gap: 10px; }
+    .endpoint-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .endpoint-item {
+      min-width: 0; padding: 12px 14px; border-radius: 14px;
+      background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+    }
     .endpoint-list a { color: var(--cyan); text-decoration: none; word-break: break-all; }
     .footer { margin-top: 14px; color: var(--muted); font-size: 12px; }
-    @media (max-width: 960px) { .grid-2 { grid-template-columns: 1fr; } .wrap { padding: 16px; } }
+    @media (max-width: 1100px) { .hero p { max-width: none; } }
+    @media (max-width: 960px) {
+      .wrap { padding: 16px; }
+      th:first-child, td:first-child { width: 118px; min-width: 118px; }
+      .endpoint-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      .endpoint-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
   <div class=\"wrap\">
     <section class=\"hero\">
-      <div>
-        <h1>rz-rpc-llm monitor</h1>
-        <p>Single-port gateway on <code>/monitor</code> for the same developer loop as <code>./deploy.sh monitor</code>: health, throughput, rolling history, and the last 5 log lines.</p>
+      <div class=\"hero-main\">
+        <div>
+          <h1>rz-rpc-llm monitor</h1>
+          <p>Single-port gateway on <code>/monitor</code> for the same developer loop as <code>./deploy.sh monitor</code>: health, throughput, rolling history, and the last 5 log lines.</p>
+        </div>
+        <div class=\"meta\" id=\"meta\"></div>
       </div>
-      <div class=\"meta\" id=\"meta\"></div>
     </section>
 
     <section class=\"cards\" id=\"cards\"></section>
 
-    <section class=\"grid-2\">
-      <div class=\"panel\">
-        <h2>Rolling History</h2>
-        <div class=\"history\"><table id=\"history\"></table></div>
-      </div>
-      <div style=\"display:grid; gap:16px;\">
-        <div class=\"panel\">
-          <h2>Endpoints</h2>
-          <div class=\"endpoint-list\" id=\"endpoints\"></div>
-        </div>
-        <div class=\"panel\">
-          <h2>Live Log</h2>
-          <pre class=\"log\" id=\"log\"></pre>
-        </div>
-      </div>
+    <section class=\"panel edge\">
+      <h2>Rolling History</h2>
+      <div class=\"history-note\">20 minute view with denser samples near the present. New samples land on the right edge and the oldest buckets fall away on the left.</div>
+      <div class=\"history\"><table id=\"history\"></table></div>
+    </section>
+
+    <section class=\"panel\" style=\"margin-top: 16px;\">
+      <h2>Live Log</h2>
+      <pre class=\"log\" id=\"log\"></pre>
+    </section>
+
+    <section class=\"panel\" style=\"margin-top: 16px;\">
+      <h2>Endpoints</h2>
+      <div class=\"endpoint-list endpoint-grid\" id=\"endpoints\"></div>
     </section>
     <div class=\"footer\" id=\"footer\"></div>
   </div>
   <script>
+    const HISTORY_WINDOW_SECONDS = 20 * 60;
+    let lastData = null;
     const rows = [
       ["Mac RAM used", "mac_ram"],
       ["Mac GPU util", "mac_gpu"],
@@ -363,6 +397,45 @@ INDEX_HTML = """<!doctype html>
       return `<div class=\"card\"><div class=\"label\">${label}</div><div class=\"value ${String(value).length > 9 ? "small" : ""} ${stateClass(value)}\">${value}</div></div>`;
     }
 
+    function historyColumnCount() {
+      if (window.innerWidth < 640) return 18;
+      if (window.innerWidth < 960) return 24;
+      return 32;
+    }
+
+    function historyBuckets(history, count) {
+      const now = history.length ? history[history.length - 1].captured_at : (Date.now() / 1000);
+      const formatAge = (seconds) => {
+        if (seconds >= 60) return `-${Math.round(seconds / 60)}m`;
+        return `-${Math.round(seconds)}s`;
+      };
+      const boundaries = Array.from({ length: count + 1 }, (_, index) => {
+        const distance = (count - index) / count;
+        return HISTORY_WINDOW_SECONDS * (distance ** 2);
+      });
+      const newestFirst = [...history].reverse();
+
+      return Array.from({ length: count }, (_, index) => {
+        const olderAge = boundaries[index];
+        const newerAge = boundaries[index + 1];
+        const labelAge = Math.max(0, Math.round((olderAge + newerAge) / 2));
+        const sample = newestFirst.find((entry) => {
+          const age = now - entry.captured_at;
+          const withinOlderBound = age <= olderAge || index === 0;
+          const withinNewerBound = age > newerAge || index === count - 1;
+          return withinOlderBound && withinNewerBound;
+        });
+
+        return sample || {
+          label: formatAge(labelAge),
+          empty: true,
+        };
+      }).map((bucket) => ({
+        ...bucket,
+        label: bucket.label || formatAge(Math.max(0, Math.round(now - bucket.captured_at))),
+      }));
+    }
+
     function render(data) {
       const latest = data.latest;
       document.getElementById("meta").innerHTML = [
@@ -384,23 +457,25 @@ INDEX_HTML = """<!doctype html>
       ].join("");
 
       const visibleRows = rows.filter((row) => !row[2] || row[2] === latest.mode);
-      const history = data.history;
+      const rawHistory = data.history;
+      const history = historyBuckets(rawHistory, historyColumnCount());
       document.getElementById("history").innerHTML =
-        `<thead><tr><th>metric</th>${history.map((h) => `<th>${h.timestamp}</th>`).join("")}</tr></thead>` +
-        `<tbody>${visibleRows.map(([label, key]) => `<tr><td>${label}</td>${history.map((h) => `<td class=\"${stateClass(h[key])}\">${h[key]}</td>`).join("")}</tr>`).join("")}</tbody>`;
+        `<thead><tr><th>metric</th>${history.map((h) => `<th>${h.label}</th>`).join("")}</tr></thead>` +
+        `<tbody>${visibleRows.map(([label, key]) => `<tr><td>${label}</td>${history.map((h) => `<td class=\"${h.empty ? "" : stateClass(h[key])}\">${h.empty ? "--" : h[key]}</td>`).join("")}</tr>`).join("")}</tbody>`;
 
       document.getElementById("endpoints").innerHTML = Object.entries(latest.endpoints)
-        .map(([k, v]) => `<div><div class=\"label\">${k}</div><a href=\"${String(v).startsWith("http") ? v : "#"}\" target=\"_blank\">${v}</a></div>`)
+        .map(([k, v]) => `<div class=\"endpoint-item\"><div class=\"label\">${k}</div><a href=\"${String(v).startsWith("http") ? v : "#"}\" target=\"_blank\">${v}</a></div>`)
         .join("");
 
       document.getElementById("log").textContent = latest.log_lines.join("\\n") || "No llama-server log yet.";
-      document.getElementById("footer").textContent = `Single-port gateway • polling /monitor/api every 3s • history size ${history.length}`;
+      document.getElementById("footer").textContent = `Single-port gateway • polling /monitor/api every 3s • ${rawHistory.length} raw samples across the last 20 minutes • ${history.length} visible history buckets`;
     }
 
     async function refresh() {
       try {
         const res = await fetch('/monitor/api', { cache: 'no-store' });
         const data = await res.json();
+        lastData = data;
         render(data);
       } catch (err) {
         document.getElementById("footer").textContent = `Monitor fetch failed: ${err}`;
@@ -409,6 +484,9 @@ INDEX_HTML = """<!doctype html>
 
     refresh();
     setInterval(refresh, 3000);
+    window.addEventListener("resize", () => {
+      if (lastData) render(lastData);
+    });
   </script>
 </body>
 </html>
