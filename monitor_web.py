@@ -278,7 +278,8 @@ def log_tail():
         lines = log_file.read_text(errors="replace").splitlines()
     except Exception:
         return []
-    return lines[-5:]
+    filtered = [l for l in lines if "GET /slots" not in l]
+    return filtered[-5:]
 
 
 def take_snapshot():
@@ -477,10 +478,12 @@ INDEX_HTML = """<!doctype html>
       ["gen tokens", "gen_tokens"],
     ];
 
+    let maxSlotsSeen = 0;
     function buildRows(latest) {
       const rows = [...baseRows];
       const nSlots = latest.n_slots || 0;
-      for (let i = 0; i < nSlots; i++) {
+      if (nSlots > maxSlotsSeen) maxSlotsSeen = nSlots;
+      for (let i = 0; i < maxSlotsSeen; i++) {
         rows.push(["ctx s" + i, "slot_ctx_" + i]);
       }
       return rows;
@@ -585,7 +588,7 @@ INDEX_HTML = """<!doctype html>
       const history = historyBuckets(rawHistory, historyColumnCount());
       document.getElementById("history").innerHTML =
         `<thead><tr><th>metric</th>${history.map((h) => `<th>${h.label}</th>`).join("")}</tr></thead>` +
-        `<tbody>${visibleRows.map(([label, key]) => `<tr><td>${label}</td>${history.map((h) => `<td class=\"${h.empty ? "" : stateClass(h[key], key)}\">${h.empty ? "--" : h[key]}</td>`).join("")}</tr>`).join("")}</tbody>`;
+        `<tbody>${visibleRows.map(([label, key]) => `<tr><td>${label}</td>${history.map((h) => { const v = h.empty ? "--" : (h[key] == null ? "--" : h[key]); return `<td class=\"${h.empty || v === "--" ? "" : stateClass(v, key)}\">${v}</td>`; }).join("")}</tr>`).join("")}</tbody>`;
 
       document.getElementById("endpoints").innerHTML = Object.entries(latest.endpoints)
         .map(([k, v]) => `<div class=\"endpoint-item\"><div class=\"label\">${k}</div><a href=\"${String(v).startsWith("http") ? v : "#"}\" target=\"_blank\">${v}</a></div>`)
