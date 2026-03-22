@@ -293,34 +293,53 @@ The terminal monitor can also be started standalone:
 
 ## Performance: token generation on Apple Silicon
 
-Running large models on Apple Silicon unified memory makes token generation fundamentally **memory-bandwidth-bound**. The M2 Ultra has ~800 GB/s bandwidth shared between CPU and GPU.
+Running large models on Apple Silicon unified memory makes token generation fundamentally **memory-bandwidth-bound**. The M2 Ultra has ~800 GB/s bandwidth shared between CPU and GPU. Every decode step reads ~105 GB of model weights plus KV cache through that single pipe.
 
 ### Lessons learned (Qwen3.5-122B-A10B on M2 Ultra 192 GB)
 
 **1. `--ctx-size` with `--kv-unified` is the total shared pool, not per-slot.**
 
-We originally multiplied `ctx_size * parallel` before passing it to `--ctx-size`. With `--kv-unified`, llama.cpp treats it as the entire shared KV pool. The multiplication caused a 4x overallocation, dropping tg from ~20 to ~3.
+We originally multiplied `ctx_size × parallel` before passing it to `--ctx-size`. With `--kv-unified`, llama.cpp treats it as the entire shared KV pool. The multiplication caused a 4× overallocation (13 GB KV cache instead of 3.25 GB), dropping tg from ~20 to ~3.
 
-**2. `--mlock` hurts on unified memory.**
+**2. `--mmap` is optimal on Apple Silicon — `--mlock` and `--no-mmap` both hurt.**
 
-On Apple Silicon the GPU already accesses the same physical memory. Pinning pages prevents macOS from optimizing page placement and adds pressure to the memory controller.
+| Flag | Effect on Apple Silicon | Recommendation |
+|---|---|---|
+| `--mmap` (default) | Metal creates GPU buffers directly from mmap'd regions via `buffer_from_host_ptr` — **zero-copy**. On unified memory the GPU reads weights straight from the memory-mapped pages with no transfer or duplication. | **Use (default)** |
+| `--mlock` | Calls `mlock()` to pin all model pages in physical RAM. On Apple Silicon the GPU already accesses the same physical memory — there is no discrete VRAM to "lock into". Pinning prevents macOS from optimizing page placement and adds wired-memory pressure to the unified memory controller. We measured a tg drop when enabling this. | **Don't use** |
+| `--no-mmap` | Forces explicit `read()` into allocated memory, losing the zero-copy Metal buffer path. Slower model loading, no inference benefit. On CUDA it enables async pinned-memory uploads, but on Metal it's strictly worse. | **Don't use** |
+
+The same recommendation applies to both solo and distributed modes — the Mac side is always Metal on unified memory. RPC-offloaded layers run on the DGX's own CUDA memory and are unaffected by Mac-side mmap/mlock settings.
 
 **3. CPU threads compete with the GPU for bandwidth.**
 
-On unified memory, CPU and GPU share the same memory bus. Reducing `--threads` from 14 to 8 in vision mode gives the GPU more bandwidth during token generation.
+On unified memory, CPU and GPU share the same memory bus. During token generation the GPU is the bottleneck, but active CPU threads still consume bandwidth for their own memory accesses. Reducing `--threads` from 14 to 8 in vision mode gives the GPU more of the ~800 GB/s pipe. Prompt processing may be slightly slower, but token generation — the user-visible latency — improves.
 
-**4. KV cache grows linearly.**
+**4. KV cache grows linearly and is the main tg scaling factor.**
 
-For this hybrid attention+SSM model, the KV cache at q8_0 grows linearly with context:
+For this hybrid attention+SSM model (12 full-attention layers out of 48), the KV cache at q8_0 grows linearly with context:
 - 25K tokens: ~300 MB read per token
 - 50K tokens: ~600 MB read per token
 - 100K tokens: ~1.2 GB read per token
 
-The monitor's `ctx s0` row tracks this in real time.
+All of this competes with the ~105 GB model weight reads on every decode step. The monitor's `ctx s0` row tracks this in real time so you can correlate tg drops with context growth.
 
 **5. `--defrag-thold` is deprecated in recent llama.cpp.**
 
 Newer versions handle KV cache defragmentation automatically. The flag is accepted but ignored. We keep it for backward compatibility.
+
+### Current tuning
+
+| Setting | Solo (Qwen3.5) | Distributed (MiniMax) | Rationale |
+|---|---|---|---|
+| `--mmap` | yes | yes | Zero-copy Metal buffer path |
+| `--mlock` | no | no | Hurts on unified memory |
+| `--ctx-size` | 131072 | 131072 | 128K shared KV pool |
+| `--parallel` | 4 | 1 | Solo can serve concurrent requests |
+| `--threads` | 8 | 14 | Solo: fewer threads = less GPU bandwidth contention |
+| `--kv-unified` | on | on | Shared KV pool across slots |
+| `--flash-attn` | on | on | Required for efficient long-context attention |
+| `--cache-type-k/v` | q8_0 | q8_0 | Good quality; q4_0 would halve KV bandwidth at quality cost |
 
 ## Build details
 
