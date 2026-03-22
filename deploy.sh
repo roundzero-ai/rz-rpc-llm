@@ -13,7 +13,7 @@
 #   download [--repo R] [--pattern P] [--dir D] [--vision]
 #   start-rpc                        Start rpc-server on DGX
 #   stop-rpc                         Stop rpc-server on DGX
-#   start-llama [--model-file F] [--alias A] [--ctx N] [--parallel N] [--vision]
+#   start-llama [--model-file F] [--alias A] [--ctx N] [--parallel N] [--vision] [--latest]
 #   stop-llama                       Stop local llama-server
 #   start-monitor-web [--port N]     Start one-port API + monitor gateway
 #   stop-monitor-web                 Stop one-port API + monitor gateway
@@ -580,6 +580,7 @@ cmd_start_llama() {
     local parallel=""
     local vision_mode=""
     local monitor_mode=""
+    local latest_mode=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -589,9 +590,17 @@ cmd_start_llama() {
             --parallel|-p)   parallel="$2";    shift 2 ;;
             --vision|-v)     vision_mode="1"; shift ;;
             --monitor)       monitor_mode="1"; shift ;;
+            --latest)        latest_mode="1"; shift ;;
             *) die "Unknown option: $1" ;;
         esac
     done
+
+    # --latest: fetch the latest llama.cpp tag, rebuild, then start
+    if [[ -n "${latest_mode}" ]]; then
+        log_section "Updating llama.cpp to latest tag"
+        cmd_clone --tag latest
+        cmd_build_mac
+    fi
 
     # Vision mode auto-enables monitor
     [[ -n "${vision_mode}" ]] && monitor_mode="1"
@@ -1549,9 +1558,10 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}stop-rpc${RESET}
        Stop rpc-server on DGX
 
-  ${CYAN}start-llama${RESET} [--model-file PATH] [--alias NAME] [--ctx N] [--parallel N] [--vision]
+  ${CYAN}start-llama${RESET} [--model-file PATH] [--alias NAME] [--ctx N] [--parallel N] [--vision] [--latest]
        Start llama-server locally
        ${GREEN}--vision${RESET} uses vision defaults (no RPC, includes --mmproj)
+       ${GREEN}--latest${RESET} fetch latest llama.cpp tag, rebuild, then start
        PATH is relative to MODELS_DIR or absolute
 
   ${CYAN}stop-llama${RESET}
