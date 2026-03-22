@@ -68,7 +68,9 @@ Mac Studio (Metal)
 Key defaults from `defaults.env`:
 
 - model: `unsloth/Qwen3.5-122B-A10B-GGUF`
-- context: `262144`
+- context: `131072` (128K shared KV pool)
+- slots: `4`
+- threads: `8` (reduced to avoid GPU bandwidth contention)
 - sampling: `temp=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`
 - split mode: `none`
 
@@ -284,9 +286,9 @@ MiniMax defaults baked into `deploy.sh`:
 - default file: `UD-Q6_K_XL/Qwen3.5-122B-A10B-UD-Q6_K_XL-00001-of-00004.gguf`
 - projector: `mmproj-BF16.gguf`
 - alias: `qwen3.5-122b-vision`
-- context per slot: `262144`
+- context: `131072` (shared KV pool via `--kv-unified`)
 - slots: `4`
-- total ctx passed to `llama-server`: `1048576`
+- threads: `8` (reduced for bandwidth)
 - KV cache: `q8_0`
 - flash attention: `on`
 
@@ -508,6 +510,51 @@ Large models can take several minutes to mmap and initialize. Check:
 - `logs/llama-server.log`
 - `http://127.0.0.1:8680/health`
 - `http://127.0.0.1:8680/metrics`
+
+## Performance: token generation speed on Apple Silicon
+
+Running large models on Apple Silicon unified memory makes token generation (tg) fundamentally **memory-bandwidth-bound**. The M2 Ultra has ~800 GB/s bandwidth shared between CPU and GPU. Every token generation step must read model weights, KV cache, and SSM state through that single pipe. As context grows, tg drops because the KV cache read grows linearly.
+
+### What we learned (Qwen3.5-122B-A10B on M2 Ultra 192 GB)
+
+**1. `--ctx-size` with `--kv-unified` is the total shared pool, not per-slot.**
+
+We originally multiplied `ctx_size × parallel` before passing it to `--ctx-size`. With `--kv-unified`, llama.cpp treats `--ctx-size` as the entire shared KV pool. The multiplication caused a 4× overallocation (13 GB KV cache instead of 3.25 GB), starving bandwidth and dropping tg from ~20 to ~3.
+
+Fix: pass the per-slot context value directly. llama.cpp handles slot sharing internally.
+
+**2. `--mlock` hurts more than it helps on unified memory.**
+
+`mlock` pins all model pages in physical memory, which sounds beneficial. But on Apple Silicon the GPU already accesses the same physical memory — there is no discrete VRAM to "lock into". The pinning prevents macOS from optimizing page placement and adds pressure to the unified memory controller. Removing `--mlock` lets the OS manage pages more efficiently and reduces bandwidth contention.
+
+**3. CPU threads compete with the GPU for bandwidth.**
+
+On unified memory, CPU and GPU share the same memory bus. During token generation the GPU is the bottleneck, but active CPU threads still consume bandwidth for their own memory accesses (thread stacks, scheduler, OS overhead). Reducing `--threads` from 14 to 8 in vision mode gives the GPU more of the bandwidth pipe. Prompt processing (pp) may be slightly slower, but token generation (tg) — the user-visible latency — improves.
+
+**4. KV cache grows linearly and is the main tg scaling factor.**
+
+For this hybrid attention+SSM model (12 full-attention layers out of 48), the KV cache at q8_0 uses roughly:
+- 25K context: ~300 MB read per token
+- 50K context: ~600 MB read per token
+- 100K context: ~1.2 GB read per token
+
+All of this competes with the ~105 GB model weight reads on every decode step. The monitor's `ctx s0` row tracks this in real time so you can correlate tg drops with context growth.
+
+**5. `--defrag-thold` is deprecated in recent llama.cpp.**
+
+Newer versions handle KV cache defragmentation automatically. The flag is accepted but ignored. We keep it in the config for backward compatibility but it has no effect.
+
+### Current tuning (vision mode)
+
+| Setting | Value | Rationale |
+|---|---|---|
+| `--ctx-size` | 131072 | 128K shared KV pool — keeps tg acceptable through the window |
+| `--parallel` | 4 | 4 slots sharing the unified KV pool |
+| `--threads` | 8 | fewer CPU threads = less bandwidth contention with GPU |
+| `--mlock` | removed | let macOS manage page placement on unified memory |
+| `--kv-unified` | on | shared KV pool across slots |
+| `--flash-attn` | on | required for efficient attention at long context |
+| `--cache-type-k/v` | q8_0 | good quality; q4_0 would halve KV bandwidth at some quality cost |
 
 ## File reference
 

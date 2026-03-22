@@ -118,6 +118,10 @@ load_config() {
     LLAMA_CONT_BATCHING="${LLAMA_CONT_BATCHING:-1}"
     LLAMA_NO_CONTEXT_SHIFT="${LLAMA_NO_CONTEXT_SHIFT:-0}"
 
+    # Vision-specific thread defaults (fewer threads = less bandwidth contention)
+    LLAMA_VISION_THREADS="${LLAMA_VISION_THREADS:-${LLAMA_THREADS:-8}}"
+    LLAMA_VISION_THREADS_BATCH="${LLAMA_VISION_THREADS_BATCH:-${LLAMA_THREADS_BATCH:-8}}"
+
     # Mode-specific model patterns and runtime defaults
     DEFAULT_VISION_MODEL_PATTERN="${DEFAULT_VISION_MODEL_PATTERN:-${DEFAULT_MODEL_PATTERN:-*UD-Q6_K_XL*}}"
 
@@ -208,6 +212,8 @@ select_runtime_profile() {
         RUNTIME_N_GPU_LAYERS="${LLAMA_VISION_N_GPU_LAYERS}"
         RUNTIME_CACHE_TYPE_K="${LLAMA_VISION_CACHE_TYPE_K}"
         RUNTIME_CACHE_TYPE_V="${LLAMA_VISION_CACHE_TYPE_V}"
+        RUNTIME_THREADS="${LLAMA_VISION_THREADS}"
+        RUNTIME_THREADS_BATCH="${LLAMA_VISION_THREADS_BATCH}"
         RUNTIME_TEMP="${LLAMA_VISION_TEMP}"
         RUNTIME_TOP_P="${LLAMA_VISION_TOP_P}"
         RUNTIME_TOP_K="${LLAMA_VISION_TOP_K}"
@@ -225,6 +231,8 @@ select_runtime_profile() {
         RUNTIME_N_GPU_LAYERS="${LLAMA_TEXT_N_GPU_LAYERS}"
         RUNTIME_CACHE_TYPE_K="${LLAMA_TEXT_CACHE_TYPE_K}"
         RUNTIME_CACHE_TYPE_V="${LLAMA_TEXT_CACHE_TYPE_V}"
+        RUNTIME_THREADS="${LLAMA_THREADS}"
+        RUNTIME_THREADS_BATCH="${LLAMA_THREADS_BATCH}"
         RUNTIME_TEMP="${LLAMA_TEXT_TEMP}"
         RUNTIME_TOP_P="${LLAMA_TEXT_TOP_P}"
         RUNTIME_TOP_K="${LLAMA_TEXT_TOP_K}"
@@ -654,6 +662,7 @@ cmd_start_llama() {
     log "Sampling   : temp=${RUNTIME_TEMP} top_p=${RUNTIME_TOP_P} top_k=${RUNTIME_TOP_K} min_p=${RUNTIME_MIN_P}"
     log "Penalties  : repeat=${RUNTIME_REPEAT_PENALTY} presence=${RUNTIME_PRESENCE_PENALTY}"
     log "Defrag     : ${LLAMA_DEFRAG_THOLD}"
+    log "Threads    : ${RUNTIME_THREADS} (batch: ${RUNTIME_THREADS_BATCH})"
 
     log "Launching llama-server..."
     local -a llama_flags=(
@@ -671,13 +680,12 @@ cmd_start_llama() {
         --port             "${LLAMA_BACKEND_PORT}"
         --prio             "${LLAMA_PRIO}"
         --parallel         "${RUNTIME_PARALLEL}"
-        --threads          "${LLAMA_THREADS}"
-        --threads-batch    "${LLAMA_THREADS_BATCH}"
+        --threads          "${RUNTIME_THREADS}"
+        --threads-batch    "${RUNTIME_THREADS_BATCH}"
         --batch-size       "${RUNTIME_BATCH_SIZE}"
         --ubatch-size      "${RUNTIME_UBATCH_SIZE}"
         --n-gpu-layers     "${RUNTIME_N_GPU_LAYERS}"
         --mmap
-        --mlock
         --kv-offload
         --kv-unified
         --flash-attn       "${LLAMA_FLASH_ATTN}"
