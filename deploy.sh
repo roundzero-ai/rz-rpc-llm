@@ -65,9 +65,36 @@ load_config() {
     log "Loaded defaults: ${DEFAULTS_FILE}"
 
     if [[ -f "${CONFIG_FILE}" ]]; then
+        # Snapshot default values before applying local overrides.
+        # After sourcing config.env we compare and warn about every override
+        # so that stale or unintentional changes are visible at startup.
+        local _drift_keys=()
+        local _drift_snap=()
+        while IFS='=' read -r _key _; do
+            [[ -z "${_key}" || "${_key}" == \#* ]] && continue
+            _key="${_key%%[[:space:]]*}"
+            _drift_keys+=("${_key}")
+            _drift_snap+=("${!_key:-}")
+        done < <(grep -E '^[A-Z_]+=' "${CONFIG_FILE}")
+
         # shellcheck source=/dev/null
         source "${CONFIG_FILE}"
         log "Loaded local overrides: ${CONFIG_FILE}"
+
+        # Report every value that config.env changed from the checked-in default
+        local _n_overrides=0
+        for _i in "${!_drift_keys[@]}"; do
+            local _k="${_drift_keys[${_i}]}"
+            local _default="${_drift_snap[${_i}]}"
+            local _current="${!_k:-}"
+            if [[ "${_current}" != "${_default}" ]]; then
+                log_warn "config.env override: ${_k}=${_current}  (default: ${_default})"
+                (( _n_overrides++ ))
+            fi
+        done
+        if (( _n_overrides > 0 )); then
+            log_warn "${_n_overrides} override(s) detected — review config.env if unexpected"
+        fi
     else
         log "No local override file at ${CONFIG_FILE} (using checked-in defaults only)"
     fi
@@ -208,16 +235,6 @@ select_runtime_profile() {
     fi
 }
 
-calculate_effective_ctx_size() {
-    local per_slot_ctx="$1"
-    local slots="$2"
-
-    [[ "${per_slot_ctx}" =~ ^[0-9]+$ ]] || die "Context size must be an integer, got: ${per_slot_ctx}"
-    [[ "${slots}" =~ ^[0-9]+$ ]] || die "Parallel slots must be an integer, got: ${slots}"
-    (( slots > 0 )) || die "Parallel slots must be greater than 0"
-
-    EFFECTIVE_CTX_SIZE=$(( per_slot_ctx * slots ))
-}
 
 # ------------------------------------------------------------------------------
 # SSH helpers — ControlMaster so password is entered only once per session
@@ -589,7 +606,6 @@ cmd_start_llama() {
     fi
 
     select_runtime_profile "${vision_mode}" "${ctx_size}" "${parallel}"
-    calculate_effective_ctx_size "${RUNTIME_CTX_SIZE}" "${RUNTIME_PARALLEL}"
 
     log_section "Start llama-server on Mac Studio"
     log "Model file : ${resolved_model}"
@@ -601,14 +617,12 @@ cmd_start_llama() {
         log "Mode       : ${GREEN}VISION (multimodal)${RESET}"
         log "MM proj    : ${resolved_mmproj}"
         log "Slots      : ${RUNTIME_PARALLEL}"
-        log "Ctx/slot   : ${RUNTIME_CTX_SIZE}"
-        log "Ctx total  : ${EFFECTIVE_CTX_SIZE}"
+        log "KV pool    : ${RUNTIME_CTX_SIZE} (unified, shared across slots)"
     else
         require_dgx_config
         log "Mode       : text-only (RPC: ${DGX_HOST}:${DGX_RPC_PORT})"
         log "Slots      : ${RUNTIME_PARALLEL}"
-        log "Ctx/slot   : ${RUNTIME_CTX_SIZE}"
-        log "Ctx total  : ${EFFECTIVE_CTX_SIZE}"
+        log "KV pool    : ${RUNTIME_CTX_SIZE} (unified, shared across slots)"
     fi
 
     local llama_bin="${LLAMA_CPP_DIR}/build/bin/llama-server"
@@ -652,7 +666,7 @@ cmd_start_llama() {
         --min-p            "${RUNTIME_MIN_P}"
         --repeat-penalty   "${RUNTIME_REPEAT_PENALTY}"
         --presence-penalty "${RUNTIME_PRESENCE_PENALTY}"
-        --ctx-size         "${EFFECTIVE_CTX_SIZE}"
+        --ctx-size         "${RUNTIME_CTX_SIZE}"
         --host             "${LLAMA_BACKEND_HOST}"
         --port             "${LLAMA_BACKEND_PORT}"
         --prio             "${LLAMA_PRIO}"
