@@ -1062,25 +1062,29 @@ PORTAL_HTML = r"""<!doctype html>
     }
 
     function historyColumnCount() {
-      if (window.innerWidth < 640) return 18;
+      if (window.innerWidth < 480) return 8;
+      if (window.innerWidth < 640) return 12;
       if (window.innerWidth < 960) return 24;
       return 32;
     }
 
     function historyBuckets(history, count) {
+      const windowSec = count >= 24 ? 20 * 60 : 5 * 60;
       const formatAge = (seconds) => {
         if (seconds >= 60) return `-${Math.round(seconds / 60)}m`;
         return `-${Math.round(seconds)}s`;
       };
       if (!history.length) {
         return Array.from({ length: count }, (_, index) => ({
-          label: formatAge((((count - index) / count) ** 2) * HISTORY_WINDOW_SECONDS),
+          label: formatAge((((count - index) / count) ** 2) * windowSec),
           empty: true,
         }));
       }
       const now = history[history.length - 1].captured_at;
-      if (history.length <= count) {
-        return history.map((entry) => ({
+      const cutoff = now - windowSec;
+      const filtered = history.filter(e => e.captured_at >= cutoff);
+      if (filtered.length <= count) {
+        return filtered.map((entry) => ({
           ...entry,
           label: formatAge(Math.max(0, Math.round(now - entry.captured_at))),
         }));
@@ -1088,8 +1092,8 @@ PORTAL_HTML = r"""<!doctype html>
       return Array.from({ length: count }, (_, index) => {
         const progress = count === 1 ? 1 : index / (count - 1);
         const weighted = 1 - ((1 - progress) ** 2);
-        const sourceIndex = Math.max(0, Math.min(history.length - 1, Math.round(weighted * (history.length - 1))));
-        const entry = history[sourceIndex];
+        const sourceIndex = Math.max(0, Math.min(filtered.length - 1, Math.round(weighted * (filtered.length - 1))));
+        const entry = filtered[sourceIndex];
         return {
           ...entry,
           label: formatAge(Math.max(0, Math.round(now - entry.captured_at))),
