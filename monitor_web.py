@@ -28,6 +28,10 @@ DGX_RPC_PORT = os.environ.get("DGX_RPC_PORT", "50052")
 CONTROL_PATH = str(PID_DIR / "ssh-dgx.ctl")
 HISTORY = deque(maxlen=512)
 HISTORY_WINDOW_SECONDS = 20 * 60
+# Per-slot tracking: remember task id and prompt token count for each active request
+# so we can compute total KV context = prompt_tokens + n_decoded.
+_slot_state = {}  # slot_id -> {"task_id": int, "prompt_tokens": int}
+_prev_prompt_total = 0.0  # running total of prompt tokens across all requests
 
 
 def run(cmd, timeout=4):
@@ -164,6 +168,73 @@ def dgx_snapshot():
     return {"ram": ram, "gpu": gpu, "rpc": (rpc.group(1).strip() if rpc else "--")}
 
 
+def format_ctx_compact(n):
+    """Format a token count into at most 5 chars: e.g. 1234 -> '1234', 12345 -> ' 12K', 131072 -> '131K'."""
+    try:
+        n = int(n)
+    except Exception:
+        return "  --"
+    if n <= 0:
+        return "    0"
+    if n < 10000:
+        return f"{n:>5d}"
+    if n < 1_000_000:
+        return f"{n // 1000:>4d}K"
+    return f"{n // 1_000_000:>4d}M"
+
+
+def slots_snapshot(health, prompt_total):
+    """Query /slots and return per-slot context info.
+
+    Uses prompt_tokens_total delta to estimate the prompt size when a slot
+    starts processing a new task, so we can report total KV context
+    (prompt_tokens + n_decoded) per slot.
+    """
+    global _slot_state, _prev_prompt_total
+    if not health:
+        return []
+    raw = fetch_text(f"{BACKEND_BASE_URL}/slots", timeout=4)
+    if not raw:
+        return []
+    try:
+        slots = json.loads(raw)
+    except Exception:
+        return []
+    result = []
+    pt = prompt_total or 0.0
+    for s in slots:
+        sid = s.get("id", 0)
+        active = s.get("is_processing", False)
+        nt = (s.get("next_token") or [{}])[0]
+        n_decoded = nt.get("n_decoded", 0)
+        task_id = s.get("id_task", -1)
+
+        prev = _slot_state.get(sid, {})
+        prompt_n = prev.get("prompt_tokens", 0)
+
+        if active and task_id != prev.get("task_id"):
+            # New task on this slot — derive prompt tokens from the
+            # cumulative counter delta since last snapshot.
+            # This is approximate when multiple slots start simultaneously
+            # but good enough for monitoring.
+            prompt_n = max(0, int(pt - _prev_prompt_total))
+            _slot_state[sid] = {
+                "task_id": task_id,
+                "prompt_tokens": prompt_n,
+            }
+        elif not active:
+            prompt_n = 0
+
+        total_ctx = prompt_n + n_decoded
+        result.append({
+            "id": sid,
+            "active": active,
+            "ctx": total_ctx,
+        })
+    _prev_prompt_total = pt
+    return result
+
+
 def llama_snapshot():
     health = bool(fetch_text(f"{BACKEND_BASE_URL}/health", timeout=2))
     metrics = fetch_text(f"{BACKEND_BASE_URL}/metrics", timeout=2) if health else ""
@@ -172,6 +243,7 @@ def llama_snapshot():
     reqs = parse_metric(metrics, "llamacpp:requests_processing")
     prompt_total = parse_metric(metrics, "llamacpp:prompt_tokens_total", as_float=True)
     gen_total = parse_metric(metrics, "llamacpp:tokens_predicted_total", as_float=True)
+    slots = slots_snapshot(health, prompt_total)
     return {
         "status": "UP" if health else "DOWN",
         "pp": f"{pp:.1f}" if pp is not None else "--",
@@ -179,6 +251,7 @@ def llama_snapshot():
         "reqs": reqs if reqs is not None else "--",
         "prompt_tokens": format_compact_number(prompt_total) if prompt_total is not None else "--",
         "gen_tokens": format_compact_number(gen_total) if gen_total is not None else "--",
+        "slots": slots,
     }
 
 
@@ -198,6 +271,15 @@ def take_snapshot():
     mode = detect_mode()
     dgx = dgx_snapshot()
     llama = llama_snapshot()
+    # Build per-slot context fields: slot_ctx_0, slot_ctx_1, ...
+    slot_fields = {}
+    slots = llama.get("slots", [])
+    for s in slots:
+        sid = s["id"]
+        if s["active"]:
+            slot_fields[f"slot_ctx_{sid}"] = format_ctx_compact(s["ctx"])
+        else:
+            slot_fields[f"slot_ctx_{sid}"] = "  --"
     snapshot = {
         "captured_at": now,
         "timestamp": subprocess.run(["date", "+%H:%M:%S"], capture_output=True, text=True).stdout.strip(),
@@ -213,6 +295,8 @@ def take_snapshot():
         "reqs": llama["reqs"],
         "prompt_tokens": llama["prompt_tokens"],
         "gen_tokens": llama["gen_tokens"],
+        "n_slots": len(slots),
+        **slot_fields,
         "log_lines": log_tail(),
         "endpoints": {
             "monitor": f"{PUBLIC_BASE_URL}/monitor",
@@ -364,7 +448,7 @@ INDEX_HTML = """<!doctype html>
   <script>
     const HISTORY_WINDOW_SECONDS = 20 * 60;
     let lastData = null;
-    const rows = [
+    const baseRows = [
       ["Mac RAM used", "mac_ram"],
       ["Mac GPU util", "mac_gpu"],
       ["DGX RAM used", "dgx_ram", "DISTRIBUTED"],
@@ -378,9 +462,32 @@ INDEX_HTML = """<!doctype html>
       ["gen tokens", "gen_tokens"],
     ];
 
-    function stateClass(value) {
+    function buildRows(latest) {
+      const rows = [...baseRows];
+      const nSlots = latest.n_slots || 0;
+      for (let i = 0; i < nSlots; i++) {
+        rows.push(["ctx s" + i, "slot_ctx_" + i]);
+      }
+      return rows;
+    }
+
+    function stateClass(value, key) {
       if (value === "UP") return "good";
       if (value === "DOWN") return "bad";
+      // Context length coloring: parse "  12K" or " 1234" style values
+      if (key && key.startsWith("slot_ctx_")) {
+        const s = String(value).trim();
+        if (s === "--") return "";
+        let tokens = 0;
+        const mK = s.match(/(\\d+)K/);
+        const mM = s.match(/(\\d+)M/);
+        if (mK) tokens = Number(mK[1]) * 1000;
+        else if (mM) tokens = Number(mM[1]) * 1000000;
+        else tokens = Number(s) || 0;
+        if (tokens < 30000) return "good";
+        if (tokens < 80000) return "warn";
+        return "bad";
+      }
       if (typeof value === "string" && value.includes("%")) {
         const match = value.match(/(\\d+)%/);
         if (match) {
@@ -457,12 +564,13 @@ INDEX_HTML = """<!doctype html>
         ...(latest.mode === "DISTRIBUTED" ? [card("dgx ram", latest.dgx_ram), card("dgx gpu", latest.dgx_gpu)] : []),
       ].join("");
 
+      const rows = buildRows(latest);
       const visibleRows = rows.filter((row) => !row[2] || row[2] === latest.mode);
       const rawHistory = data.history;
       const history = historyBuckets(rawHistory, historyColumnCount());
       document.getElementById("history").innerHTML =
         `<thead><tr><th>metric</th>${history.map((h) => `<th>${h.label}</th>`).join("")}</tr></thead>` +
-        `<tbody>${visibleRows.map(([label, key]) => `<tr><td>${label}</td>${history.map((h) => `<td class=\"${h.empty ? "" : stateClass(h[key])}\">${h.empty ? "--" : h[key]}</td>`).join("")}</tr>`).join("")}</tbody>`;
+        `<tbody>${visibleRows.map(([label, key]) => `<tr><td>${label}</td>${history.map((h) => `<td class=\"${h.empty ? "" : stateClass(h[key], key)}\">${h.empty ? "--" : h[key]}</td>`).join("")}</tr>`).join("")}</tbody>`;
 
       document.getElementById("endpoints").innerHTML = Object.entries(latest.endpoints)
         .map(([k, v]) => `<div class=\"endpoint-item\"><div class=\"label\">${k}</div><a href=\"${String(v).startsWith("http") ? v : "#"}\" target=\"_blank\">${v}</a></div>`)
