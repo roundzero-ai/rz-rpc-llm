@@ -3,25 +3,18 @@
 # rz-rpc-llm — LLaMA.cpp Deployment
 #
 # Two modes:
-#   - Distributed:  DGX Spark GB10 (CUDA)  → rpc-server  +  Mac Studio (Metal)
-#   - Vision:      Mac Studio alone with --vision flag (Qwen3.5 + mmproj)
+#   - Distributed: Mac Studio (Metal) + DGX Spark GB10 (CUDA) via RPC
+#   - Solo:        Mac Studio alone
 #
 # Usage: ./deploy.sh <command> [options]
-#   clone   [--tag TAG]              Clone llama.cpp (`latest` resolves latest tag)
-#   build-dgx                        Sync source to DGX and build
-#   build-mac                        Build on local Mac
-#   download [--repo R] [--pattern P] [--dir D] [--vision]
-#   start-rpc                        Start rpc-server on DGX
-#   stop-rpc                         Stop rpc-server on DGX
-#   start-llama [--model-file F] [--alias A] [--ctx N] [--parallel N] [--vision] [--latest]
-#   stop-llama                       Stop local llama-server
-#   start-monitor-web [--port N]     Start one-port API + monitor gateway
-#   stop-monitor-web                 Stop one-port API + monitor gateway
-#   deploy  [--tag TAG] [--model-file F] [--alias A]
-#   full    [--tag TAG] [--model-file F] [--alias A]
-#                                    Full pipeline: clone→build→start
+#   run --model NAME [--vision] [--solo|--distributed] [--tag TAG] [--ctx N]
+#                    [--parallel N] [--skip-clone] [--skip-build] [--skip-download]
+#   stop                             Stop all services
 #   status                           Show running processes
-#   logs    [rpc|llama]              Tail logs
+#   logs   [llama|rpc|monitor]       Tail logs
+#   monitor [INTERVAL] [WIDTH]       Terminal heartbeat monitor
+#   models                           List available models
+#   debug <step> [args...]           Run individual pipeline steps
 # ==============================================================================
 
 set -euo pipefail
@@ -29,6 +22,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS_FILE="${SCRIPT_DIR}/defaults.env"
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
+MODELS_CONF="${SCRIPT_DIR}/models.conf"
 PID_DIR="${SCRIPT_DIR}/.pids"
 LOG_DIR="${SCRIPT_DIR}/logs"
 
@@ -118,43 +112,6 @@ load_config() {
     LLAMA_CONT_BATCHING="${LLAMA_CONT_BATCHING:-1}"
     LLAMA_NO_CONTEXT_SHIFT="${LLAMA_NO_CONTEXT_SHIFT:-0}"
 
-    # Vision-specific thread defaults (fewer threads = less bandwidth contention)
-    LLAMA_VISION_THREADS="${LLAMA_VISION_THREADS:-${LLAMA_THREADS:-8}}"
-    LLAMA_VISION_THREADS_BATCH="${LLAMA_VISION_THREADS_BATCH:-${LLAMA_THREADS_BATCH:-8}}"
-
-    # Mode-specific model patterns and runtime defaults
-    DEFAULT_VISION_MODEL_PATTERN="${DEFAULT_VISION_MODEL_PATTERN:-${DEFAULT_MODEL_PATTERN:-*UD-Q6_K_XL*}}"
-
-    LLAMA_TEXT_CTX_SIZE="${LLAMA_TEXT_CTX_SIZE:-${LLAMA_CTX_SIZE:-131072}}"
-    LLAMA_TEXT_PARALLEL="${LLAMA_TEXT_PARALLEL:-${LLAMA_PARALLEL:-1}}"
-    LLAMA_TEXT_BATCH_SIZE="${LLAMA_TEXT_BATCH_SIZE:-${LLAMA_BATCH_SIZE:-2048}}"
-    LLAMA_TEXT_UBATCH_SIZE="${LLAMA_TEXT_UBATCH_SIZE:-${LLAMA_UBATCH_SIZE:-512}}"
-    LLAMA_TEXT_N_GPU_LAYERS="${LLAMA_TEXT_N_GPU_LAYERS:-${LLAMA_N_GPU_LAYERS:-all}}"
-    LLAMA_TEXT_CACHE_TYPE_K="${LLAMA_TEXT_CACHE_TYPE_K:-${LLAMA_CACHE_TYPE_K:-q8_0}}"
-    LLAMA_TEXT_CACHE_TYPE_V="${LLAMA_TEXT_CACHE_TYPE_V:-${LLAMA_CACHE_TYPE_V:-q8_0}}"
-    LLAMA_TEXT_TEMP="${LLAMA_TEXT_TEMP:-1.0}"
-    LLAMA_TEXT_TOP_P="${LLAMA_TEXT_TOP_P:-0.95}"
-    LLAMA_TEXT_TOP_K="${LLAMA_TEXT_TOP_K:-40}"
-    LLAMA_TEXT_MIN_P="${LLAMA_TEXT_MIN_P:-0.01}"
-    LLAMA_TEXT_REPEAT_PENALTY="${LLAMA_TEXT_REPEAT_PENALTY:-1.0}"
-    LLAMA_TEXT_PRESENCE_PENALTY="${LLAMA_TEXT_PRESENCE_PENALTY:-0.0}"
-    LLAMA_TEXT_REASONING_FORMAT="${LLAMA_TEXT_REASONING_FORMAT:-auto}"
-
-    LLAMA_VISION_CTX_SIZE="${LLAMA_VISION_CTX_SIZE:-${LLAMA_CTX_SIZE:-262144}}"
-    LLAMA_VISION_PARALLEL="${LLAMA_VISION_PARALLEL:-${LLAMA_PARALLEL:-1}}"
-    LLAMA_VISION_BATCH_SIZE="${LLAMA_VISION_BATCH_SIZE:-${LLAMA_BATCH_SIZE:-2048}}"
-    LLAMA_VISION_UBATCH_SIZE="${LLAMA_VISION_UBATCH_SIZE:-${LLAMA_UBATCH_SIZE:-512}}"
-    LLAMA_VISION_N_GPU_LAYERS="${LLAMA_VISION_N_GPU_LAYERS:-${LLAMA_N_GPU_LAYERS:-all}}"
-    LLAMA_VISION_CACHE_TYPE_K="${LLAMA_VISION_CACHE_TYPE_K:-${LLAMA_CACHE_TYPE_K:-q8_0}}"
-    LLAMA_VISION_CACHE_TYPE_V="${LLAMA_VISION_CACHE_TYPE_V:-${LLAMA_CACHE_TYPE_V:-q8_0}}"
-    LLAMA_VISION_TEMP="${LLAMA_VISION_TEMP:-${LLAMA_TEMP:-1.0}}"
-    LLAMA_VISION_TOP_P="${LLAMA_VISION_TOP_P:-${LLAMA_TOP_P:-0.95}}"
-    LLAMA_VISION_TOP_K="${LLAMA_VISION_TOP_K:-${LLAMA_TOP_K:-20}}"
-    LLAMA_VISION_MIN_P="${LLAMA_VISION_MIN_P:-${LLAMA_MIN_P:-0.0}}"
-    LLAMA_VISION_REPEAT_PENALTY="${LLAMA_VISION_REPEAT_PENALTY:-${LLAMA_REPEAT_PENALTY:-1.0}}"
-    LLAMA_VISION_PRESENCE_PENALTY="${LLAMA_VISION_PRESENCE_PENALTY:-${LLAMA_PRESENCE_PENALTY:-1.5}}"
-    LLAMA_VISION_REASONING_FORMAT="${LLAMA_VISION_REASONING_FORMAT:-auto}"
-
     # Allow HF_TOKEN override from environment
     HF_TOKEN="${HF_TOKEN:-}"
     if [[ -n "${HF_TOKEN_ENV:-}" ]]; then
@@ -197,50 +154,145 @@ resolve_latest_local_tag() {
     echo "${latest_tag}"
 }
 
-select_runtime_profile() {
-    local vision_mode="${1:-}"
-    local ctx_override="${2:-}"
-    local parallel_override="${3:-}"
+# ------------------------------------------------------------------------------
+# Model registry (models.conf INI parser)
+# ------------------------------------------------------------------------------
+load_model_registry() {
+    local input_key="$1"
+    local key
+    key="$(echo "${input_key}" | tr '[:upper:]' '[:lower:]')"
 
-    if [[ -n "${vision_mode}" ]]; then
-        RUNTIME_PROFILE_NAME="Qwen3.5-122B-A10B"
-        RUNTIME_PROFILE_KIND="vision"
-        RUNTIME_CTX_SIZE="${ctx_override:-${LLAMA_VISION_CTX_SIZE}}"
-        RUNTIME_PARALLEL="${parallel_override:-${LLAMA_VISION_PARALLEL}}"
-        RUNTIME_BATCH_SIZE="${LLAMA_VISION_BATCH_SIZE}"
-        RUNTIME_UBATCH_SIZE="${LLAMA_VISION_UBATCH_SIZE}"
-        RUNTIME_N_GPU_LAYERS="${LLAMA_VISION_N_GPU_LAYERS}"
-        RUNTIME_CACHE_TYPE_K="${LLAMA_VISION_CACHE_TYPE_K}"
-        RUNTIME_CACHE_TYPE_V="${LLAMA_VISION_CACHE_TYPE_V}"
-        RUNTIME_THREADS="${LLAMA_VISION_THREADS}"
-        RUNTIME_THREADS_BATCH="${LLAMA_VISION_THREADS_BATCH}"
-        RUNTIME_TEMP="${LLAMA_VISION_TEMP}"
-        RUNTIME_TOP_P="${LLAMA_VISION_TOP_P}"
-        RUNTIME_TOP_K="${LLAMA_VISION_TOP_K}"
-        RUNTIME_MIN_P="${LLAMA_VISION_MIN_P}"
-        RUNTIME_REPEAT_PENALTY="${LLAMA_VISION_REPEAT_PENALTY}"
-        RUNTIME_PRESENCE_PENALTY="${LLAMA_VISION_PRESENCE_PENALTY}"
-        RUNTIME_REASONING_FORMAT="${LLAMA_VISION_REASONING_FORMAT}"
-    else
-        RUNTIME_PROFILE_NAME="MiniMax-M2.5"
-        RUNTIME_PROFILE_KIND="distributed"
-        RUNTIME_CTX_SIZE="${ctx_override:-${LLAMA_TEXT_CTX_SIZE}}"
-        RUNTIME_PARALLEL="${parallel_override:-${LLAMA_TEXT_PARALLEL}}"
-        RUNTIME_BATCH_SIZE="${LLAMA_TEXT_BATCH_SIZE}"
-        RUNTIME_UBATCH_SIZE="${LLAMA_TEXT_UBATCH_SIZE}"
-        RUNTIME_N_GPU_LAYERS="${LLAMA_TEXT_N_GPU_LAYERS}"
-        RUNTIME_CACHE_TYPE_K="${LLAMA_TEXT_CACHE_TYPE_K}"
-        RUNTIME_CACHE_TYPE_V="${LLAMA_TEXT_CACHE_TYPE_V}"
-        RUNTIME_THREADS="${LLAMA_THREADS}"
-        RUNTIME_THREADS_BATCH="${LLAMA_THREADS_BATCH}"
-        RUNTIME_TEMP="${LLAMA_TEXT_TEMP}"
-        RUNTIME_TOP_P="${LLAMA_TEXT_TOP_P}"
-        RUNTIME_TOP_K="${LLAMA_TEXT_TOP_K}"
-        RUNTIME_MIN_P="${LLAMA_TEXT_MIN_P}"
-        RUNTIME_REPEAT_PENALTY="${LLAMA_TEXT_REPEAT_PENALTY}"
-        RUNTIME_PRESENCE_PENALTY="${LLAMA_TEXT_PRESENCE_PENALTY}"
-        RUNTIME_REASONING_FORMAT="${LLAMA_TEXT_REASONING_FORMAT}"
+    [[ -f "${MODELS_CONF}" ]] || die "models.conf not found at ${MODELS_CONF}"
+
+    # Resolve partial match: if key doesn't match a section exactly, try prefix match
+    local resolved_key=""
+    local matches=()
+    while IFS= read -r line; do
+        if [[ "${line}" =~ ^\[(.+)\]$ ]]; then
+            local sec="${BASH_REMATCH[1]}"
+            sec="$(echo "${sec}" | tr '[:upper:]' '[:lower:]')"
+            if [[ "${sec}" == "${key}" ]]; then
+                resolved_key="${sec}"; break
+            elif [[ "${sec}" == "${key}"* ]]; then
+                matches+=("${sec}")
+            fi
+        fi
+    done < "${MODELS_CONF}"
+
+    if [[ -z "${resolved_key}" ]]; then
+        if (( ${#matches[@]} == 1 )); then
+            resolved_key="${matches[0]}"
+        elif (( ${#matches[@]} > 1 )); then
+            die "Ambiguous model: '${input_key}'. Matches: ${matches[*]}"
+        else
+            die "Unknown model: '${input_key}'. Available models: $(list_models)"
+        fi
     fi
+
+    # Clear all MODEL_* variables
+    MODEL_DISPLAY_NAME="" MODEL_REPO="" MODEL_PATTERN="" MODEL_FILE=""
+    MODEL_ALIAS="" MODEL_DEFAULT_MODE="" MODEL_SOLO="" MODEL_VISION=""
+    MODEL_MM_PROJ="" MODEL_MM_PROJ_PATTERN=""
+    MODEL_THREADS="" MODEL_THREADS_BATCH="" MODEL_CTX_SIZE="" MODEL_PARALLEL=""
+    MODEL_BATCH_SIZE="" MODEL_UBATCH_SIZE="" MODEL_N_GPU_LAYERS=""
+    MODEL_SPLIT_MODE="" MODEL_TENSOR_SPLIT=""
+    MODEL_CACHE_TYPE_K="" MODEL_CACHE_TYPE_V=""
+    MODEL_TEMP="" MODEL_TOP_P="" MODEL_TOP_K="" MODEL_MIN_P=""
+    MODEL_REPEAT_PENALTY="" MODEL_PRESENCE_PENALTY="" MODEL_REASONING_FORMAT=""
+
+    local in_section=0 found=0
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "${line}" || "${line}" == \#* ]] && continue
+        if [[ "${line}" =~ ^\[(.+)\]$ ]]; then
+            local section="${BASH_REMATCH[1]}"
+            section="$(echo "${section}" | tr '[:upper:]' '[:lower:]')"
+            if [[ "${section}" == "${resolved_key}" ]]; then
+                in_section=1; found=1
+            else
+                (( in_section )) && break
+                in_section=0
+            fi
+            continue
+        fi
+        if (( in_section )) && [[ "${line}" =~ ^([a-z_]+)[[:space:]]*=[[:space:]]*(.*) ]]; then
+            local field="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            value="${value%"${value##*[![:space:]]}"}"
+            local upper_field
+            upper_field="$(echo "${field}" | tr '[:lower:]' '[:upper:]')"
+            local varname="MODEL_${upper_field}"
+            printf -v "${varname}" '%s' "${value}"
+        fi
+    done < "${MODELS_CONF}"
+
+    if (( ! found )); then
+        die "Unknown model: '${input_key}'. Available models: $(list_models)"
+    fi
+
+    # Validate required fields
+    local missing=()
+    [[ -z "${MODEL_REPO}" ]] && missing+=("repo")
+    [[ -z "${MODEL_FILE}" ]] && missing+=("file")
+    [[ -z "${MODEL_ALIAS}" ]] && missing+=("alias")
+    [[ -z "${MODEL_DEFAULT_MODE}" ]] && missing+=("default_mode")
+    [[ -z "${MODEL_SOLO}" ]] && missing+=("solo")
+    [[ -z "${MODEL_VISION}" ]] && missing+=("vision")
+    if (( ${#missing[@]} > 0 )); then
+        die "Model '${input_key}' is missing required fields: ${missing[*]}"
+    fi
+}
+
+list_models() {
+    [[ -f "${MODELS_CONF}" ]] || die "models.conf not found at ${MODELS_CONF}"
+    local models=()
+    while IFS= read -r line; do
+        if [[ "${line}" =~ ^\[(.+)\]$ ]]; then
+            models+=("${BASH_REMATCH[1]}")
+        fi
+    done < "${MODELS_CONF}"
+    echo "${models[*]}"
+}
+
+resolve_run_mode() {
+    local override="${1:-}"
+    if [[ -z "${override}" ]]; then
+        RUNTIME_MODE="${MODEL_DEFAULT_MODE}"
+    elif [[ "${override}" == "solo" ]]; then
+        if [[ "${MODEL_SOLO}" == "no" ]]; then
+            die "${MODEL_DISPLAY_NAME} cannot run in solo mode (requires distributed — too large for 192GB Mac Studio)."
+        fi
+        RUNTIME_MODE="solo"
+    elif [[ "${override}" == "distributed" ]]; then
+        RUNTIME_MODE="distributed"
+    else
+        die "Invalid mode: '${override}'. Use --solo or --distributed."
+    fi
+}
+
+select_runtime_profile() {
+    local ctx_override="${1:-}"
+    local parallel_override="${2:-}"
+
+    RUNTIME_PROFILE_NAME="${MODEL_DISPLAY_NAME}"
+    RUNTIME_PROFILE_KIND="${RUNTIME_MODE}"
+    RUNTIME_CTX_SIZE="${ctx_override:-${MODEL_CTX_SIZE}}"
+    RUNTIME_PARALLEL="${parallel_override:-${MODEL_PARALLEL}}"
+    RUNTIME_BATCH_SIZE="${MODEL_BATCH_SIZE}"
+    RUNTIME_UBATCH_SIZE="${MODEL_UBATCH_SIZE}"
+    RUNTIME_N_GPU_LAYERS="${MODEL_N_GPU_LAYERS}"
+    RUNTIME_CACHE_TYPE_K="${MODEL_CACHE_TYPE_K}"
+    RUNTIME_CACHE_TYPE_V="${MODEL_CACHE_TYPE_V}"
+    RUNTIME_THREADS="${MODEL_THREADS}"
+    RUNTIME_THREADS_BATCH="${MODEL_THREADS_BATCH}"
+    RUNTIME_TEMP="${MODEL_TEMP}"
+    RUNTIME_TOP_P="${MODEL_TOP_P}"
+    RUNTIME_TOP_K="${MODEL_TOP_K}"
+    RUNTIME_MIN_P="${MODEL_MIN_P}"
+    RUNTIME_REPEAT_PENALTY="${MODEL_REPEAT_PENALTY}"
+    RUNTIME_PRESENCE_PENALTY="${MODEL_PRESENCE_PENALTY}"
+    RUNTIME_REASONING_FORMAT="${MODEL_REASONING_FORMAT}"
 }
 
 
@@ -415,13 +467,15 @@ cmd_download() {
     local local_dir=""
     local mmproj_pattern=""
     local vision_mode=""
+    local model_name=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --repo)        repo="$2";       shift 2 ;;
-            --pattern|-p)  pattern="$2";    shift 2 ;;
+            --repo)        repo="$2";        shift 2 ;;
+            --pattern|-p)  pattern="$2";     shift 2 ;;
             --dir)         local_dir="$2";   shift 2 ;;
             --vision|-v)   vision_mode="1";  shift ;;
+            --model|-m)    model_name="$2";  shift 2 ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -432,20 +486,30 @@ cmd_download() {
 
     mkdir -p "${MODELS_DIR}"
 
-    if [[ -n "${vision_mode}" ]]; then
-        repo="${repo:-${DEFAULT_VISION_REPO:-unsloth/Qwen3.5-122B-A10B-GGUF}}"
-        pattern="${pattern:-${DEFAULT_VISION_MODEL_PATTERN}}"
-        mmproj_pattern="${DEFAULT_MM_PROJ_PATTERN:-mmproj*.gguf}"
-        local_dir="${local_dir:-${MODELS_DIR}}"
+    # If --model is given, load defaults from model registry
+    if [[ -n "${model_name}" ]]; then
+        load_model_registry "${model_name}"
+        repo="${repo:-${MODEL_REPO}}"
+        pattern="${pattern:-${MODEL_PATTERN}}"
+        if [[ -n "${vision_mode}" ]] && [[ -n "${MODEL_MM_PROJ_PATTERN:-}" ]]; then
+            mmproj_pattern="${MODEL_MM_PROJ_PATTERN}"
+        fi
+    fi
 
-        log_section "Download Vision Model"
+    [[ -n "${repo}" ]] || die "Missing --repo or --model. Specify which model to download."
+    [[ -n "${pattern}" ]] || die "Missing --pattern or --model."
+    local_dir="${local_dir:-${MODELS_DIR}}"
+
+    if ! command -v huggingface-cli &>/dev/null; then
+        die "huggingface-cli not found. Install it with: pip install huggingface_hub"
+    fi
+
+    if [[ -n "${vision_mode}" ]] && [[ -n "${mmproj_pattern}" ]]; then
+        log_section "Download Model + Vision Projector"
         log "HF repo  : ${repo}"
         log "Pattern  : ${pattern} + ${mmproj_pattern}"
         log "Local dir: ${local_dir}"
 
-        if ! command -v huggingface-cli &>/dev/null; then
-            die "huggingface-cli not found. Install it with: pip install huggingface_hub"
-        fi
         log "Downloading model + mmproj (this may take a while)..."
         if [[ -n "${token}" ]]; then
             HF_TOKEN="${token}" huggingface-cli download "${repo}" \
@@ -456,40 +520,26 @@ cmd_download() {
                 --local-dir "${local_dir}" \
                 --include "${pattern}" "${mmproj_pattern}"
         fi
-
-        log_ok "Download complete → ${local_dir}"
-        log "GGUF files:"
-        find "${local_dir}" -name "*.gguf" | sort | sed 's/^/  /'
-        return 0
-    fi
-
-    repo="${repo:-${DEFAULT_MODEL_REPO}}"
-    pattern="${pattern:-${DEFAULT_MODEL_PATTERN}}"
-    local_dir="${local_dir:-${MODELS_DIR}}"
-
-    log_section "Download Model"
-    log "HF repo  : ${repo}"
-    log "Pattern  : ${pattern}"
-    log "Local dir: ${local_dir}"
-
-    if ! command -v huggingface-cli &>/dev/null; then
-        die "huggingface-cli not found. Install it with: pip install huggingface_hub"
-    fi
-    log "huggingface-cli: $(command -v huggingface-cli)"
-
-    log "Downloading (this may take a while)..."
-    if [[ -n "${token}" ]]; then
-        HF_TOKEN="${token}" huggingface-cli download "${repo}" \
-            --local-dir "${local_dir}" \
-            --include "${pattern}"
     else
-        huggingface-cli download "${repo}" \
-            --local-dir "${local_dir}" \
-            --include "${pattern}"
+        log_section "Download Model"
+        log "HF repo  : ${repo}"
+        log "Pattern  : ${pattern}"
+        log "Local dir: ${local_dir}"
+
+        log "Downloading (this may take a while)..."
+        if [[ -n "${token}" ]]; then
+            HF_TOKEN="${token}" huggingface-cli download "${repo}" \
+                --local-dir "${local_dir}" \
+                --include "${pattern}"
+        else
+            huggingface-cli download "${repo}" \
+                --local-dir "${local_dir}" \
+                --include "${pattern}"
+        fi
     fi
 
     log_ok "Download complete → ${local_dir}"
-    log "Files:"
+    log "GGUF files:"
     find "${local_dir}" -name "*.gguf" | sort | sed 's/^/  /'
 }
 
@@ -571,80 +621,39 @@ cmd_stop_rpc() {
 }
 
 # ------------------------------------------------------------------------------
-# Command: start-llama
+# Command: _launch_llama_server (internal helper)
+# Requires MODEL_* and RUNTIME_* variables to be populated.
+# Expects: VISION_ACTIVE (1 or ""), MONITOR_AFTER_START (1 or "")
 # ------------------------------------------------------------------------------
-cmd_start_llama() {
-    local model_file=""
-    local model_alias=""
-    local ctx_size=""
-    local parallel=""
-    local vision_mode=""
-    local monitor_mode=""
-    local latest_mode=""
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --model-file|-m) model_file="$2";  shift 2 ;;
-            --alias|-a)      model_alias="$2"; shift 2 ;;
-            --ctx|-c)        ctx_size="$2";    shift 2 ;;
-            --parallel|-p)   parallel="$2";    shift 2 ;;
-            --vision|-v)     vision_mode="1"; shift ;;
-            --monitor)       monitor_mode="1"; shift ;;
-            --latest)        latest_mode="1"; shift ;;
-            *) die "Unknown option: $1" ;;
-        esac
-    done
-
-    # Vision mode auto-enables monitor
-    [[ -n "${vision_mode}" ]] && monitor_mode="1"
-
-    load_config
-
-    # --latest: fetch the latest llama.cpp tag, rebuild, then start
-    if [[ -n "${latest_mode}" ]]; then
-        log_section "Updating llama.cpp to latest tag"
-        cmd_clone --tag latest
-        cmd_build_mac
-    fi
-
-    if [[ -n "${vision_mode}" ]]; then
-        model_file="${model_file:-${DEFAULT_VISION_MODEL_FILE}}"
-        model_alias="${model_alias:-${DEFAULT_VISION_ALIAS}}"
-    else
-        model_file="${model_file:-${DEFAULT_MODEL_FILE}}"
-        model_alias="${model_alias:-${DEFAULT_MODEL_ALIAS}}"
-    fi
-
+_launch_llama_server() {
     local resolved_model resolved_mmproj
-    resolved_model="$(resolve_model_file "${model_file}")"
+    resolved_model="$(resolve_model_file "${MODEL_FILE}")"
     resolved_mmproj=""
-    if [[ -n "${vision_mode}" ]]; then
-        resolved_mmproj="$(resolve_model_file "${DEFAULT_VISION_MM_PROJ}")"
+    if [[ "${VISION_ACTIVE}" == "1" ]] && [[ -n "${MODEL_MM_PROJ:-}" ]]; then
+        resolved_mmproj="$(resolve_model_file "${MODEL_MM_PROJ}")"
     fi
-
-    select_runtime_profile "${vision_mode}" "${ctx_size}" "${parallel}"
 
     log_section "Start llama-server on Mac Studio"
     log "Model file : ${resolved_model}"
-    log "Model alias: ${model_alias}"
+    log "Model alias: ${MODEL_ALIAS}"
     log "Public API : ${LLAMA_HOST}:${LLAMA_PORT}"
     log "Backend    : ${LLAMA_BACKEND_HOST}:${LLAMA_BACKEND_PORT}"
 
-    if [[ -n "${vision_mode}" ]]; then
-        log "Mode       : ${GREEN}VISION (multimodal)${RESET}"
-        log "MM proj    : ${resolved_mmproj}"
-        log "Slots      : ${RUNTIME_PARALLEL}"
-        log "KV pool    : ${RUNTIME_CTX_SIZE} (unified, shared across slots)"
-    else
+    if [[ "${RUNTIME_MODE}" == "distributed" ]]; then
         require_dgx_config
-        log "Mode       : text-only (RPC: ${DGX_HOST}:${DGX_RPC_PORT})"
-        log "Slots      : ${RUNTIME_PARALLEL}"
-        log "KV pool    : ${RUNTIME_CTX_SIZE} (unified, shared across slots)"
+        log "Mode       : distributed (RPC: ${DGX_HOST}:${DGX_RPC_PORT})"
+    else
+        log "Mode       : ${GREEN}solo${RESET}"
     fi
+    if [[ "${VISION_ACTIVE}" == "1" ]]; then
+        log "Vision     : ${GREEN}ON${RESET} (mmproj: ${resolved_mmproj})"
+    fi
+    log "Slots      : ${RUNTIME_PARALLEL}"
+    log "KV pool    : ${RUNTIME_CTX_SIZE} (unified, shared across slots)"
 
     local llama_bin="${LLAMA_CPP_DIR}/build/bin/llama-server"
-    [[ -x "${llama_bin}" ]] || die "llama-server not found at ${llama_bin}. Run: ./deploy.sh build-mac"
-    [[ -f "${resolved_model}" ]] || die "Model file not found: ${resolved_model}. Run: ./deploy.sh download"
+    [[ -x "${llama_bin}" ]] || die "llama-server not found at ${llama_bin}. Run: ./deploy.sh debug build-mac"
+    [[ -f "${resolved_model}" ]] || die "Model file not found: ${resolved_model}. Run: ./deploy.sh run --model ... (will auto-download)"
 
     mkdir -p "${PID_DIR}" "${LOG_DIR}"
     local pid_file="${PID_DIR}/llama-server.pid"
@@ -655,7 +664,7 @@ cmd_start_llama() {
         old_pid="$(cat "${pid_file}")"
         if kill -0 "${old_pid}" 2>/dev/null; then
             log_warn "llama-server already running (PID ${old_pid})"
-            log_warn "Run './deploy.sh stop-llama' first to restart."
+            log_warn "Run './deploy.sh stop' first to restart."
             return 0
         else
             log_warn "Stale PID file, cleaning up..."
@@ -663,8 +672,8 @@ cmd_start_llama() {
         fi
     fi
 
-    if [[ -n "${vision_mode}" ]] && [[ ! -f "${resolved_mmproj}" ]]; then
-        die "MM proj file not found: ${resolved_mmproj}. Download with: ./deploy.sh download --vision"
+    if [[ "${VISION_ACTIVE}" == "1" ]] && [[ -n "${resolved_mmproj}" ]] && [[ ! -f "${resolved_mmproj}" ]]; then
+        die "MM proj file not found: ${resolved_mmproj}"
     fi
 
     log "Profile    : ${RUNTIME_PROFILE_NAME} (${RUNTIME_PROFILE_KIND})"
@@ -676,7 +685,7 @@ cmd_start_llama() {
     log "Launching llama-server..."
     local -a llama_flags=(
         --model            "${resolved_model}"
-        --alias            "${model_alias}"
+        --alias            "${MODEL_ALIAS}"
         --jinja
         --temp             "${RUNTIME_TEMP}"
         --top-p            "${RUNTIME_TOP_P}"
@@ -709,17 +718,20 @@ cmd_start_llama() {
         llama_flags+=(--reasoning-format "${RUNTIME_REASONING_FORMAT}")
     fi
 
-    if [[ -n "${vision_mode}" ]]; then
-        llama_flags+=(
-            --mmproj     "${resolved_mmproj}"
-            --split-mode none
-        )
-    else
+    # Vision: add mmproj
+    if [[ "${VISION_ACTIVE}" == "1" ]] && [[ -n "${resolved_mmproj}" ]]; then
+        llama_flags+=(--mmproj "${resolved_mmproj}")
+    fi
+
+    # Mode-specific flags
+    if [[ "${RUNTIME_MODE}" == "distributed" ]]; then
         llama_flags+=(
             --rpc            "${DGX_HOST}:${DGX_RPC_PORT}"
-            --split-mode     "${LLAMA_SPLIT_MODE}"
-            --tensor-split   "${LLAMA_TENSOR_SPLIT}"
+            --split-mode     "${MODEL_SPLIT_MODE}"
+            --tensor-split   "${MODEL_TENSOR_SPLIT}"
         )
+    else
+        llama_flags+=(--split-mode "${MODEL_SPLIT_MODE:-none}")
     fi
 
     if [[ "${LLAMA_CONT_BATCHING}" == "1" ]]; then
@@ -743,7 +755,6 @@ cmd_start_llama() {
     local llama_pid=$!
     echo "${llama_pid}" > "${pid_file}"
 
-    # Poll health — 2s intervals, 10 min ceiling (large model loads take time)
     log "PID ${llama_pid} — polling health every 2s (up to 10 min)..."
     local elapsed=0
     local limit=600
@@ -757,7 +768,7 @@ cmd_start_llama() {
             log_ok "Monitor UI: http://127.0.0.1:${LLAMA_PORT}/monitor"
             log_ok "Metrics: http://127.0.0.1:${LLAMA_PORT}/metrics"
             log "Log: ${log_file}"
-            if [[ -n "${monitor_mode}" ]]; then
+            if [[ "${MONITOR_AFTER_START}" == "1" ]]; then
                 echo
                 cmd_monitor
             fi
@@ -776,6 +787,55 @@ cmd_start_llama() {
     done
     echo
     log_warn "Server did not respond within ${limit}s — check logs: ${log_file}"
+}
+
+# ------------------------------------------------------------------------------
+# Command: start-llama (legacy, used by debug)
+# ------------------------------------------------------------------------------
+cmd_start_llama() {
+    local model_file="" model_alias="" ctx_size="" parallel=""
+    local vision_mode="" monitor_mode="" latest_mode=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model-file|-m) model_file="$2";  shift 2 ;;
+            --alias|-a)      model_alias="$2"; shift 2 ;;
+            --ctx|-c)        ctx_size="$2";    shift 2 ;;
+            --parallel|-p)   parallel="$2";    shift 2 ;;
+            --vision|-v)     vision_mode="1"; shift ;;
+            --monitor)       monitor_mode="1"; shift ;;
+            --latest)        latest_mode="1"; shift ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    [[ -n "${vision_mode}" ]] && monitor_mode="1"
+    load_config
+
+    if [[ -n "${latest_mode}" ]]; then
+        log_section "Updating llama.cpp to latest tag"
+        cmd_clone --tag latest
+        cmd_build_mac
+    fi
+
+    # Map legacy --vision flag to model registry
+    if [[ -n "${vision_mode}" ]]; then
+        load_model_registry "qwen3.5-122b"
+        RUNTIME_MODE="solo"
+        VISION_ACTIVE="1"
+    else
+        load_model_registry "minimax-m2.5"
+        RUNTIME_MODE="distributed"
+        VISION_ACTIVE=""
+    fi
+
+    # Apply overrides
+    [[ -n "${model_file}" ]] && MODEL_FILE="${model_file}"
+    [[ -n "${model_alias}" ]] && MODEL_ALIAS="${model_alias}"
+
+    select_runtime_profile "${ctx_size}" "${parallel}"
+    MONITOR_AFTER_START="${monitor_mode}"
+    _launch_llama_server
 }
 
 # ------------------------------------------------------------------------------
@@ -951,7 +1011,7 @@ cmd_deploy() {
 
     log_section "Full Deploy Pipeline"
     log "Tag          : ${tag:-HEAD}"
-    log "Model file   : ${model_file:-${DEFAULT_MODEL_FILE}}"
+    log "Model file   : ${model_file:-(default from start-llama)}"
     log "Skip clone   : ${skip_clone}"
     log "Skip build   : ${skip_build}"
     log "Skip download: ${skip_download}"
@@ -968,14 +1028,13 @@ cmd_deploy() {
     fi
 
     if (( ! skip_download )); then
-        cmd_download
+        cmd_download --model minimax-m2.5
     fi
 
     log "Stopping existing servers so new build and config take effect..."
     cmd_stop_llama || true
     cmd_stop_rpc || true
 
-    # Start RPC first, then llama-server
     cmd_start_rpc
 
     local llama_args=()
@@ -1001,6 +1060,141 @@ cmd_deploy() {
     log_ok "Metrics   : http://127.0.0.1:${LLAMA_PORT}/metrics"
 
     cmd_monitor
+}
+
+# ------------------------------------------------------------------------------
+# Command: run (primary entry point)
+# ------------------------------------------------------------------------------
+cmd_run() {
+    local model_name="" vision_mode="" mode_override="" tag=""
+    local ctx_size="" parallel=""
+    local skip_clone=0 skip_build=0 skip_download=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model|-m)      model_name="$2";   shift 2 ;;
+            --vision|-v)     vision_mode="1";    shift ;;
+            --solo)          mode_override="solo"; shift ;;
+            --distributed)   mode_override="distributed"; shift ;;
+            --tag|-t)        tag="$2";           shift 2 ;;
+            --ctx|-c)        ctx_size="$2";      shift 2 ;;
+            --parallel|-p)   parallel="$2";      shift 2 ;;
+            --skip-clone)    skip_clone=1;       shift ;;
+            --skip-build)    skip_build=1;       shift ;;
+            --skip-download) skip_download=1;    shift ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    [[ -n "${model_name}" ]] || die "Missing --model NAME. Available models: $(list_models)"
+
+    load_config
+    load_model_registry "${model_name}"
+
+    # Validate --vision flag
+    if [[ -n "${vision_mode}" ]] && [[ "${MODEL_VISION}" == "no" ]]; then
+        die "${MODEL_DISPLAY_NAME} does not support vision mode."
+    fi
+    VISION_ACTIVE="${vision_mode}"
+
+    resolve_run_mode "${mode_override}"
+    select_runtime_profile "${ctx_size}" "${parallel}"
+
+    log_section "Run: ${MODEL_DISPLAY_NAME}"
+    log "Mode       : ${RUNTIME_MODE}"
+    log "Vision     : ${VISION_ACTIVE:-off}"
+    log "Tag        : ${tag:-latest}"
+
+    # 1. Clone llama.cpp if needed
+    if (( ! skip_clone )); then
+        if [[ ! -d "${LLAMA_CPP_DIR}/.git" ]]; then
+            cmd_clone --tag "${tag:-latest}"
+        elif [[ -n "${tag}" ]]; then
+            cmd_clone --tag "${tag}"
+        fi
+    fi
+
+    # 2. Build
+    if (( ! skip_build )); then
+        if [[ "${RUNTIME_MODE}" == "distributed" ]]; then
+            cmd_build_dgx
+        fi
+        cmd_build_mac
+    fi
+
+    # 3. Download model if not present
+    if (( ! skip_download )); then
+        local resolved_model
+        resolved_model="$(resolve_model_file "${MODEL_FILE}")"
+        if [[ ! -f "${resolved_model}" ]]; then
+            log_section "Downloading ${MODEL_DISPLAY_NAME}"
+            local dl_args=(--repo "${MODEL_REPO}" --pattern "${MODEL_PATTERN}")
+            if [[ "${VISION_ACTIVE}" == "1" ]] && [[ -n "${MODEL_MM_PROJ_PATTERN:-}" ]]; then
+                dl_args+=(--vision)
+            fi
+            cmd_download "${dl_args[@]}"
+        else
+            log "Model file exists: ${resolved_model}"
+        fi
+    fi
+
+    # 4. Stop existing servers
+    log "Stopping existing servers..."
+    cmd_stop_llama 2>/dev/null || true
+    if [[ "${RUNTIME_MODE}" == "distributed" ]]; then
+        cmd_stop_rpc 2>/dev/null || true
+    fi
+
+    # 5. Start RPC if distributed
+    if [[ "${RUNTIME_MODE}" == "distributed" ]]; then
+        cmd_start_rpc
+    fi
+
+    # 6. Launch llama-server + monitor-web, then enter terminal monitor
+    MONITOR_AFTER_START="1"
+    _launch_llama_server
+}
+
+# ------------------------------------------------------------------------------
+# Command: stop (all services)
+# ------------------------------------------------------------------------------
+cmd_stop() {
+    load_config
+    log_section "Stopping all services"
+    cmd_stop_llama 2>/dev/null || true
+    # Only attempt RPC stop if DGX SSH master is active (avoids password prompt)
+    if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+            "${DGX_USER:-nobody}@${DGX_HOST:-localhost}" &>/dev/null 2>&1; then
+        cmd_stop_rpc 2>/dev/null || true
+    fi
+    cmd_stop_monitor_web 2>/dev/null || true
+    log_ok "All services stopped"
+}
+
+# ------------------------------------------------------------------------------
+# Command: debug (individual pipeline steps)
+# ------------------------------------------------------------------------------
+cmd_debug() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: ./deploy.sh debug <step> [args...]"
+        echo "Steps: clone, build-mac, build-dgx, download, start-rpc, stop-rpc,"
+        echo "       start-llama, stop-llama, start-monitor-web, stop-monitor-web"
+        exit 1
+    fi
+    local step="$1"; shift
+    case "${step}" in
+        clone)              load_config; cmd_clone "$@" ;;
+        build-dgx)         cmd_build_dgx "$@" ;;
+        build-mac)         cmd_build_mac "$@" ;;
+        download)          cmd_download "$@" ;;
+        start-rpc)         cmd_start_rpc "$@" ;;
+        stop-rpc)          cmd_stop_rpc "$@" ;;
+        start-llama)       cmd_start_llama "$@" ;;
+        stop-llama)        cmd_stop_llama "$@" ;;
+        start-monitor-web) cmd_start_monitor_web "$@" ;;
+        stop-monitor-web)  cmd_stop_monitor_web "$@" ;;
+        *) die "Unknown debug step: '${step}'" ;;
+    esac
 }
 
 # ------------------------------------------------------------------------------
@@ -1533,57 +1727,24 @@ cmd_logs() {
 # ------------------------------------------------------------------------------
 usage() {
     cat <<EOF
-${BOLD}rz-rpc-llm${RESET} — LLaMA.cpp deployment (distributed text or vision)
+${BOLD}rz-rpc-llm${RESET} — LLaMA.cpp deployment for Mac Studio + DGX Spark
 
 ${BOLD}USAGE${RESET}
   ./deploy.sh <command> [options]
 
 ${BOLD}COMMANDS${RESET}
-  ${CYAN}clone${RESET}    [--tag TAG]
-       Clone llama.cpp at HEAD, or use --tag TAG / --tag latest
+  ${CYAN}run${RESET}      --model NAME [--vision] [--solo|--distributed] [--tag TAG]
+                          [--ctx N] [--parallel N]
+                          [--skip-clone] [--skip-build] [--skip-download]
+       Full pipeline: clone → build → download → start → monitor
+       ${GREEN}--model${RESET}        Model from models.conf (case-insensitive)
+       ${GREEN}--vision${RESET}       Enable vision mode (model must support it)
+       ${GREEN}--solo${RESET}         Force solo mode (Mac only)
+       ${GREEN}--distributed${RESET}  Force distributed mode (Mac + DGX)
+       ${GREEN}--tag${RESET}          llama.cpp tag (default: latest)
 
-  ${CYAN}build-dgx${RESET}
-       Rsync source to DGX and build with CUDA (SM121)
-
-  ${CYAN}build-mac${RESET}
-       Build locally on Mac with Metal
-
-  ${CYAN}download${RESET} [--repo REPO] [--pattern GLOB] [--dir DIR] [--vision]
-       Download model from HuggingFace
-       ${GREEN}--vision${RESET} downloads Qwen3.5-122B model + mmproj for multimodal
-
-  ${CYAN}start-rpc${RESET}
-       Start rpc-server on DGX (for distributed text inference)
-
-  ${CYAN}stop-rpc${RESET}
-       Stop rpc-server on DGX
-
-  ${CYAN}start-llama${RESET} [--model-file PATH] [--alias NAME] [--ctx N] [--parallel N] [--vision] [--latest]
-       Start llama-server locally
-       ${GREEN}--vision${RESET} uses vision defaults (no RPC, includes --mmproj)
-       ${GREEN}--latest${RESET} fetch latest llama.cpp tag, rebuild, then start
-       PATH is relative to MODELS_DIR or absolute
-
-  ${CYAN}stop-llama${RESET}
-       Stop local llama-server
-
-  ${CYAN}start-monitor-web${RESET} [--port PORT]
-       Start a colorful browser dashboard that shares the same public port as the API
-
-  ${CYAN}stop-monitor-web${RESET}
-       Stop the API + monitor gateway
-
-  ${CYAN}deploy${RESET}   [--tag TAG] [--model-file PATH] [--alias NAME]
-                 [--skip-clone] [--skip-build] [--skip-download]
-       Full pipeline: clone → build-dgx → build-mac → download → start-rpc → start-llama
-
-  ${CYAN}full${RESET}     [--tag TAG] [--model-file PATH] [--alias NAME]
-                 [--skip-clone] [--skip-build] [--skip-download]
-       Shortcut for ${CYAN}deploy${RESET}
-
-  ${CYAN}monitor${RESET}  [INTERVAL_SEC] [TABLE_WIDTH]
-       Heartbeat rolling table — default 30s interval, 180-char table width
-       Ctrl+C gracefully stops all servers
+  ${CYAN}stop${RESET}
+       Stop all services (llama-server, rpc-server, monitor-web)
 
   ${CYAN}status${RESET}
        Show running process status for both devices
@@ -1591,25 +1752,38 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}logs${RESET}     [llama|rpc|monitor]
        Tail logs (default: llama)
 
+  ${CYAN}monitor${RESET}  [INTERVAL_SEC] [TABLE_WIDTH]
+       Heartbeat rolling table — Ctrl+C stops all servers
+
+  ${CYAN}models${RESET}
+       List available models from models.conf
+
+  ${CYAN}debug${RESET}    <step> [args...]
+       Run individual pipeline steps:
+       clone, build-mac, build-dgx, download, start-rpc, stop-rpc,
+       start-llama, stop-llama, start-monitor-web, stop-monitor-web
+
 ${BOLD}EXAMPLES${RESET}
-  ${BOLD}# Distributed text inference (Mac + DGX):${RESET}
-  ./deploy.sh deploy --tag b8223
+  ${BOLD}# Vision model (Qwen3.5, Mac solo):${RESET}
+  ./deploy.sh run --model qwen3.5 --vision
 
-  ${BOLD}# Vision model (Mac solo, no DGX needed):${RESET}
-  ./deploy.sh download --vision
-  ./deploy.sh start-llama --vision
+  ${BOLD}# Distributed text (MiniMax, Mac + DGX):${RESET}
+  ./deploy.sh run --model minimax
 
-  # Restart vision model
-  ./deploy.sh stop-llama
-  ./deploy.sh start-llama --vision
+  ${BOLD}# Pin a specific llama.cpp version:${RESET}
+  ./deploy.sh run --model qwen3.5 --vision --tag b8223
 
-  ${BOLD}# Check health${RESET}
+  ${BOLD}# Skip rebuild:${RESET}
+  ./deploy.sh run --model qwen3.5 --vision --skip-clone --skip-build
+
+  ${BOLD}# Check status:${RESET}
   ./deploy.sh status
-  curl http://localhost:${LLAMA_PORT:-8680}/health
 
-  ${BOLD}# Start the web monitor${RESET}
-  ./deploy.sh start-monitor-web
-  open http://127.0.0.1:${MONITOR_WEB_PORT:-8680}/monitor
+  ${BOLD}# Stop everything:${RESET}
+  ./deploy.sh stop
+
+  ${BOLD}# Debug: manual step:${RESET}
+  ./deploy.sh debug build-mac
 
 EOF
 }
@@ -1626,20 +1800,22 @@ main() {
     local cmd="$1"; shift
 
     case "${cmd}" in
-        clone)       load_config; cmd_clone "$@" ;;
-        build-dgx)   cmd_build_dgx "$@" ;;
-        build-mac)   cmd_build_mac "$@" ;;
-        download)    cmd_download "$@" ;;
-        start-rpc)   cmd_start_rpc "$@" ;;
-        stop-rpc)    cmd_stop_rpc "$@" ;;
-        start-llama) cmd_start_llama "$@" ;;
-        stop-llama)  cmd_stop_llama "$@" ;;
-        start-monitor-web) cmd_start_monitor_web "$@" ;;
-        stop-monitor-web)  cmd_stop_monitor_web "$@" ;;
-        deploy|full) cmd_deploy "$@" ;;
-        monitor)     cmd_monitor "$@" ;;
-        status)      cmd_status "$@" ;;
-        logs)        cmd_logs "$@" ;;
+        run)     cmd_run "$@" ;;
+        stop)    cmd_stop "$@" ;;
+        status)  cmd_status "$@" ;;
+        logs)    cmd_logs "$@" ;;
+        monitor) cmd_monitor "$@" ;;
+        models)  list_models ;;
+        debug)   cmd_debug "$@" ;;
+        # Deprecated — warn and forward
+        deploy|full)
+            log_warn "Deprecated: use './deploy.sh run --model <name>' instead."
+            cmd_deploy "$@"
+            ;;
+        clone|build-dgx|build-mac|download|start-rpc|stop-rpc|start-llama|stop-llama|start-monitor-web|stop-monitor-web)
+            log_warn "Deprecated: use './deploy.sh debug ${cmd}' instead."
+            cmd_debug "${cmd}" "$@"
+            ;;
         help|--help|-h) usage ;;
         *) log_error "Unknown command: ${cmd}"; usage; exit 1 ;;
     esac
