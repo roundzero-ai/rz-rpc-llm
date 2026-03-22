@@ -16,6 +16,26 @@ Each model in `models.conf` declares a default mode and whether solo is allowed.
 ## Architecture
 
 ```text
+Terminal                          Browser
+  |                                |
+  | ./deploy.sh managed            |
+  |   1. prompt SSH password       |
+  |   2. establish ControlMaster   |
+  |   3. start monitor_web.py      |
+  |   4. block (trap Ctrl+C)       |
+  |                                |
+  |                          http://HOST:8680/
+  |                           Portal + Monitor
+  |                                |
+  |                          Deploy / Redeploy
+  |                           from browser UI
+  |                                |
+  | Ctrl+C ────────────────────>   |
+  |   stop llama-server            |
+  |   stop rpc-server              |
+  |   stop monitor-web             |
+  |   exit                         |
+
 Client
   |
   | HTTP :8680
@@ -24,7 +44,7 @@ Mac Studio (Metal)
   - llama-server (backend on :8682)
   - monitor-web gateway (public on :8680)
   - proxies /v1, /health, /metrics to backend
-  - serves /monitor UI directly
+  - serves portal UI at / and /monitor
   |
   | RPC :50052 (distributed mode only)
   v
@@ -39,7 +59,7 @@ DGX Spark GB10 (CUDA)
 rz-rpc-llm/
 |- deploy.sh              # deployment CLI
 |- models.conf            # model registry (checked in)
-|- monitor_web.py         # browser monitor gateway
+|- monitor_web.py         # web portal + monitor gateway
 |- defaults.env           # infrastructure defaults (checked in)
 |- config.env.example     # local override template
 |- config.env             # optional local overrides (gitignored)
@@ -82,30 +102,37 @@ cd rz-rpc-llm
 chmod +x deploy.sh
 ```
 
-### Vision (Qwen3.5, Mac solo)
+### Web portal (recommended)
 
 ```bash
+./deploy.sh managed
+```
+
+This starts the management portal:
+1. Prompts for DGX SSH password in the terminal
+2. Establishes a persistent SSH ControlMaster connection
+3. Starts the web portal at `http://HOST:8680/`
+4. Blocks — Ctrl+C stops all services and exits
+
+Open `http://127.0.0.1:8680/` in a browser to:
+- Select a model from `models.conf` (mode, vision, context auto-populated)
+- Pick a `llama.cpp` tag, toggle skip options
+- Deploy with one click — streaming progress log in the browser
+- Monitor hardware, server health, slots, and live logs
+- Redeploy a different model without leaving the browser
+
+### CLI alternative
+
+For scripted or headless use, `run` drives the same pipeline from the terminal:
+
+```bash
+# Vision model (Qwen3.5, Mac solo)
 ./deploy.sh run --model qwen3.5 --vision
-```
 
-This single command will:
-1. Clone `llama.cpp` (latest tag)
-2. Build `llama-server` on Mac
-3. Download the Qwen3.5-122B model + mmproj from Hugging Face
-4. Start `llama-server` and the monitor-web gateway
-5. Enter the terminal heartbeat monitor
-
-### Distributed text (MiniMax, Mac + DGX)
-
-```bash
+# Distributed text (MiniMax, Mac + DGX)
 ./deploy.sh run --model minimax
-```
 
-Same pipeline, but also builds and starts `rpc-server` on the DGX.
-
-### Skip steps on subsequent runs
-
-```bash
+# Skip steps on subsequent runs
 ./deploy.sh run --model qwen3.5 --vision --skip-clone --skip-build
 ```
 
@@ -117,7 +144,8 @@ Same pipeline, but also builds and starts `rpc-server` on the DGX.
 
 | Command | Purpose |
 |---|---|
-| `run --model NAME [flags]` | Full pipeline: clone, build, download, start, monitor |
+| `managed` | **Recommended.** Web portal for deploy, monitor, and redeploy |
+| `run --model NAME [flags]` | CLI pipeline: clone, build, download, start, terminal monitor |
 | `stop` | Stop all services (llama-server, rpc-server, monitor-web) |
 | `status` | Show running process status |
 | `logs [llama\|rpc\|monitor]` | Tail logs |
@@ -221,12 +249,19 @@ Overrides are reported at startup so drift is visible.
 
 | Endpoint | Purpose |
 |---|---|
+| `http://127.0.0.1:8680/` | Web management portal (deploy + monitor) |
 | `http://127.0.0.1:8680/v1` | OpenAI-compatible API |
-| `http://127.0.0.1:8680/v1/models` | List loaded models |
+| `http://127.0.0.1:8680/v1/models` | List loaded models (includes `rz-llm-default` alias) |
 | `http://127.0.0.1:8680/health` | Health check |
 | `http://127.0.0.1:8680/metrics` | Prometheus metrics |
-| `http://127.0.0.1:8680/monitor` | Browser monitor UI |
+| `http://127.0.0.1:8680/monitor` | Monitor dashboard (also embedded in portal) |
 | `http://127.0.0.1:8680/monitor/api` | JSON snapshot + rolling history |
+| `http://127.0.0.1:8680/api/models` | Model registry from `models.conf` (JSON) |
+| `http://127.0.0.1:8680/api/tags` | Available `llama.cpp` git tags (JSON) |
+| `http://127.0.0.1:8680/api/status` | Deployment state (JSON) |
+| `http://127.0.0.1:8680/api/deploy` | POST: start deployment |
+| `http://127.0.0.1:8680/api/deploy/stream` | SSE: deployment log stream |
+| `http://127.0.0.1:8680/api/deploy/cancel` | POST: cancel running deployment |
 
 ## API examples
 
@@ -259,6 +294,20 @@ curl http://127.0.0.1:8680/v1/chat/completions \
   }'
 ```
 
+### Model-agnostic requests
+
+The `/v1/models` endpoint injects an `rz-llm-default` alias pointing to whatever model is currently loaded. Clients can use this to avoid hardcoding model names:
+
+```bash
+curl http://127.0.0.1:8680/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "rz-llm-default",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 256
+  }'
+```
+
 ### Disabling Qwen thinking mode
 
 ```json
@@ -273,9 +322,7 @@ curl http://127.0.0.1:8680/v1/chat/completions \
 
 ## Monitor
 
-The `run` command automatically starts both the terminal monitor and the browser monitor.
-
-The browser monitor is at `http://127.0.0.1:8680/monitor` (shares the same port as the API). It shows:
+In managed mode, the monitor dashboard is integrated into the web portal at `http://127.0.0.1:8680/`. It is also available standalone at `/monitor`. It shows:
 
 - Mac/DGX memory and GPU utilization
 - Server health, pp/tg speed, request counts
@@ -283,13 +330,13 @@ The browser monitor is at `http://127.0.0.1:8680/monitor` (shares the same port 
 - Rolling history with color-coded thresholds
 - Live llama-server log tail
 
-The terminal monitor can also be started standalone:
+The `run` command starts both the browser monitor and a terminal heartbeat monitor. The terminal monitor can also be started standalone:
 
 ```bash
 ./deploy.sh monitor 15
 ```
 
-`Ctrl+C` from the monitor stops `llama-server`.
+`Ctrl+C` from the terminal monitor stops `llama-server`.
 
 ## Performance: token generation on Apple Silicon
 

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
+import configparser
 import http.client
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,18 +29,278 @@ DGX_HOST = os.environ.get("DGX_HOST", "")
 DGX_USER = os.environ.get("DGX_USER", "")
 DGX_RPC_PORT = os.environ.get("DGX_RPC_PORT", "50052")
 CONTROL_PATH = str(PID_DIR / "ssh-dgx.ctl")
+DEPLOY_SCRIPT = str(ROOT / "deploy.sh")
 HISTORY = deque(maxlen=512)
 HISTORY_WINDOW_SECONDS = 20 * 60
-# Cache of task_id -> prompt token count, parsed from llama-server log.
-_task_prompt_tokens = {}  # task_id -> n_tokens from "new prompt" log line
+_task_prompt_tokens = {}
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 
-def run(cmd, timeout=4):
+def strip_ansi(s):
+    return _ANSI_RE.sub('', s)
+
+
+# ---------------------------------------------------------------------------
+# Deployment state machine
+# ---------------------------------------------------------------------------
+
+class DeploymentState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.status = "idle"
+        self.deploy_id = ""
+        self.step = ""
+        self.model_name = ""
+        self.started_at = 0.0
+        self.log_lines = []
+        self.log_cursor = 0
+        self.process = None
+        self.serving_model = ""
+
+    def start(self, model, deploy_id):
+        with self.lock:
+            if self.status == "deploying":
+                return False
+            self.status = "deploying"
+            self.deploy_id = deploy_id
+            self.step = "initializing"
+            self.model_name = model
+            self.started_at = time.time()
+            self.log_lines = []
+            self.log_cursor = 0
+            self.process = None
+            return True
+
+    def append_log(self, line):
+        with self.lock:
+            self.log_lines.append(line)
+            self.log_cursor += 1
+            if len(self.log_lines) > 5000:
+                self.log_lines = self.log_lines[-4000:]
+
+    def get_logs_since(self, cursor):
+        with self.lock:
+            total = self.log_cursor
+            available = len(self.log_lines)
+            skip = max(0, available - (total - cursor))
+            lines = self.log_lines[skip:] if cursor < total else []
+            return lines, total
+
+    def set_step(self, name):
+        with self.lock:
+            self.step = name
+
+    def finish(self, success):
+        with self.lock:
+            self.status = "success" if success else "failed"
+            if success:
+                self.serving_model = self.model_name
+            self.process = None
+
+    def cancel(self):
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                self.process.terminate()
+            self.status = "failed"
+            self.step = "cancelled"
+
+    def to_dict(self):
+        with self.lock:
+            return {
+                "status": self.status,
+                "deploy_id": self.deploy_id,
+                "step": self.step,
+                "model_name": self.model_name,
+                "serving_model": self.serving_model,
+                "started_at": self.started_at,
+                "elapsed": (time.time() - self.started_at) if self.status == "deploying" else 0,
+            }
+
+
+DEPLOY = DeploymentState()
+
+
+# ---------------------------------------------------------------------------
+# Model registry & tag helpers
+# ---------------------------------------------------------------------------
+
+def parse_models_conf():
+    conf = configparser.ConfigParser()
+    conf.read(str(ROOT / "models.conf"))
+    models = []
+    for section in conf.sections():
+        m = dict(conf[section])
+        m["id"] = section
+        models.append(m)
+    return models
+
+
+def get_llama_tags():
+    llama_dir = ROOT / "llama.cpp"
+    if not (llama_dir / ".git").is_dir():
+        return []
+    run_cmd(["git", "-C", str(llama_dir), "fetch", "--tags", "--prune"], timeout=30)
+    code, out, _ = run_cmd(["git", "-C", str(llama_dir), "tag", "--sort=-version:refname"], timeout=10)
+    if code != 0:
+        return []
+    tags = [t.strip() for t in out.splitlines() if t.strip()]
+    return tags[:50]
+
+
+# ---------------------------------------------------------------------------
+# Deployment pipeline — runs in a daemon thread
+# ---------------------------------------------------------------------------
+
+_SECTION_RE = re.compile(r'═{4,}')
+
+
+def _run_step(step_name, cmd, env):
+    """Run a single deploy.sh step, streaming output to DEPLOY."""
+    DEPLOY.set_step(step_name)
+    DEPLOY.append_log(f"\n>>> {step_name}\n")
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, env=env, cwd=str(ROOT),
+    )
+    with DEPLOY.lock:
+        DEPLOY.process = proc
+    for line in proc.stdout:
+        DEPLOY.append_log(strip_ansi(line.rstrip('\n')))
+    proc.wait()
+    with DEPLOY.lock:
+        DEPLOY.process = None
+    if proc.returncode != 0:
+        DEPLOY.append_log(f"Step '{step_name}' failed (exit {proc.returncode})")
+        return False
+    return True
+
+
+def run_deployment(params):
+    """Full deployment pipeline. Called in a daemon thread."""
+    env = {**os.environ, "TERM": "dumb", "SKIP_MONITOR_RESTART": "1"}
+    model = params.get("model", "")
+    mode = params.get("mode", "")
+    vision = params.get("vision", False)
+    tag = params.get("tag", "")
+    ctx = params.get("ctx", "")
+    parallel = params.get("parallel", "")
+    skip_clone = params.get("skip_clone", False)
+    skip_build = params.get("skip_build", False)
+    skip_download = params.get("skip_download", False)
+
+    try:
+        # 1. Clone
+        if not skip_clone and tag:
+            if not _run_step("clone", ["bash", DEPLOY_SCRIPT, "debug", "clone", "--tag", tag], env):
+                DEPLOY.finish(False)
+                return
+        elif not skip_clone:
+            llama_dir = ROOT / "llama.cpp"
+            if not (llama_dir / ".git").is_dir():
+                if not _run_step("clone", ["bash", DEPLOY_SCRIPT, "debug", "clone", "--tag", "latest"], env):
+                    DEPLOY.finish(False)
+                    return
+
+        # 2. Build DGX (if distributed)
+        if not skip_build and mode == "distributed":
+            if not _run_step("build-dgx", ["bash", DEPLOY_SCRIPT, "debug", "build-dgx"], env):
+                DEPLOY.finish(False)
+                return
+
+        # 3. Build Mac
+        if not skip_build:
+            if not _run_step("build-mac", ["bash", DEPLOY_SCRIPT, "debug", "build-mac"], env):
+                DEPLOY.finish(False)
+                return
+
+        # 4. Download model
+        if not skip_download:
+            dl_cmd = ["bash", DEPLOY_SCRIPT, "debug", "download", "--model", model]
+            if vision:
+                dl_cmd.append("--vision")
+            if not _run_step("download", dl_cmd, env):
+                DEPLOY.finish(False)
+                return
+
+        # 5. Stop existing
+        _run_step("stop-llama", ["bash", DEPLOY_SCRIPT, "debug", "stop-llama"], env)
+
+        # 6. Stop RPC if needed
+        if mode == "distributed":
+            _run_step("stop-rpc", ["bash", DEPLOY_SCRIPT, "debug", "stop-rpc"], env)
+
+        # 7. Start RPC if distributed
+        if mode == "distributed":
+            if not _run_step("start-rpc", ["bash", DEPLOY_SCRIPT, "debug", "start-rpc"], env):
+                DEPLOY.finish(False)
+                return
+
+        # 8. Start llama-server
+        start_cmd = ["bash", DEPLOY_SCRIPT, "debug", "start-llama", "--model", model]
+        if vision:
+            start_cmd.append("--vision")
+        if mode == "solo":
+            start_cmd.append("--solo")
+        elif mode == "distributed":
+            start_cmd.append("--distributed")
+        if ctx:
+            start_cmd.extend(["--ctx", str(ctx)])
+        if parallel:
+            start_cmd.extend(["--parallel", str(parallel)])
+        if not _run_step("start-llama", start_cmd, env):
+            DEPLOY.finish(False)
+            return
+
+        DEPLOY.append_log("\nDeployment complete.")
+        DEPLOY.finish(True)
+
+    except Exception as exc:
+        DEPLOY.append_log(f"\nDeployment error: {exc}")
+        DEPLOY.finish(False)
+
+
+def handle_deploy_stream(handler):
+    """SSE endpoint streaming deployment log."""
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.end_headers()
+    cursor = 0
+    while True:
+        lines, cursor = DEPLOY.get_logs_since(cursor)
+        for line in lines:
+            data = json.dumps({"line": line, "step": DEPLOY.step, "status": DEPLOY.status})
+            handler.wfile.write(f"data: {data}\n\n".encode())
+        try:
+            handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        if DEPLOY.status in ("success", "failed", "idle"):
+            data = json.dumps({"done": True, "status": DEPLOY.status})
+            handler.wfile.write(f"data: {data}\n\n".encode())
+            try:
+                handler.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        time.sleep(0.3)
+
+
+# ---------------------------------------------------------------------------
+# Monitoring helpers (unchanged from original)
+# ---------------------------------------------------------------------------
+
+def run_cmd(cmd, timeout=4):
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
         return out.returncode, out.stdout.strip(), out.stderr.strip()
     except Exception:
         return 1, "", ""
+
+
+# Keep 'run' as alias for existing code
+run = run_cmd
 
 
 def fetch_text(url, timeout=2):
@@ -49,7 +312,6 @@ def fetch_text(url, timeout=2):
 
 
 def format_compact_number(value):
-    """Format a number to at most 5 chars: 999, 1.2K, 12K, 100K, 1.2M, 12M."""
     try:
         value = float(value)
     except Exception:
@@ -163,7 +425,6 @@ def dgx_snapshot():
 
 
 def format_ctx_compact(n):
-    """Format a token count into at most 5 chars: e.g. 1234 -> '1234', 12345 -> '12K', 131072 -> '131K'."""
     try:
         n = int(n)
     except Exception:
@@ -183,18 +444,15 @@ _NEW_PROMPT_RE = re.compile(
 
 
 def _refresh_task_prompt_cache():
-    """Scan the last portion of llama-server.log for 'new prompt' lines
-    and cache task_id -> prompt token count."""
     log_file = LOG_DIR / "llama-server.log"
     if not log_file.exists():
         return
     try:
-        # Read last 64KB — enough to cover recent requests
         size = log_file.stat().st_size
         with open(log_file, "r", errors="replace") as f:
             if size > 65536:
                 f.seek(size - 65536)
-                f.readline()  # skip partial line
+                f.readline()
             for line in f:
                 m = _NEW_PROMPT_RE.search(line)
                 if m:
@@ -206,11 +464,6 @@ def _refresh_task_prompt_cache():
 
 
 def slots_snapshot(health):
-    """Query /slots and return per-slot context info.
-
-    Looks up prompt token count from the llama-server log (parsed from
-    "new prompt" lines) and adds n_decoded to get total KV context.
-    """
     if not health:
         return []
     raw = fetch_text(f"{BACKEND_BASE_URL}/slots", timeout=4)
@@ -280,7 +533,6 @@ def take_snapshot():
     mode = detect_mode()
     dgx = dgx_snapshot()
     llama = llama_snapshot()
-    # Build per-slot context fields: slot_ctx_0, slot_ctx_1, ...
     slot_fields = {}
     slots = llama.get("slots", [])
     for s in slots:
@@ -323,12 +575,16 @@ def take_snapshot():
     return snapshot
 
 
-INDEX_HTML = """<!doctype html>
-<html lang=\"en\">
+# ---------------------------------------------------------------------------
+# Portal HTML — deploy panel + integrated monitor
+# ---------------------------------------------------------------------------
+
+PORTAL_HTML = r"""<!doctype html>
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>rz-rpc-llm Monitor</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rz-rpc-llm Portal</title>
   <style>
     :root {
       --bg: #0a0f16;
@@ -364,9 +620,8 @@ INDEX_HTML = """<!doctype html>
     .hero-main { display: grid; gap: 16px; }
     .hero h1 { margin: 0; font-size: clamp(24px, 4vw, 40px); }
     .hero p { margin: 0; color: var(--muted); max-width: 72ch; }
-    .meta, .cards { display: grid; gap: 14px; }
-    .meta { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
-    .cards { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); margin: 18px 0; }
+    .meta { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+    .cards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); margin: 18px 0; }
     .card, .panel {
       background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
       padding: 16px; box-shadow: var(--shadow); backdrop-filter: blur(14px);
@@ -400,7 +655,7 @@ INDEX_HTML = """<!doctype html>
       border-bottom: 1px solid rgba(255,255,255,0.06);
     }
     .log {
-      margin: 0; padding: 14px; min-height: 250px; border-radius: 14px; overflow: auto;
+      margin: 0; padding: 14px; min-height: 150px; border-radius: 14px; overflow: auto;
       background: linear-gradient(180deg, rgba(5,8,14,0.95), rgba(8,11,18,0.95));
       border: 1px solid rgba(255,255,255,0.06); color: #d7f5e7; line-height: 1.55;
     }
@@ -412,51 +667,343 @@ INDEX_HTML = """<!doctype html>
     }
     .endpoint-list a { color: var(--cyan); text-decoration: none; word-break: break-all; }
     .footer { margin-top: 14px; color: var(--muted); font-size: 12px; }
-    @media (max-width: 1100px) { .hero p { max-width: none; } }
+
+    /* Deploy panel */
+    .deploy-section { margin-bottom: 18px; }
+    .model-cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin: 12px 0; }
+    .model-card {
+      padding: 14px 16px; border-radius: 14px; cursor: pointer;
+      background: rgba(255,255,255,0.03); border: 2px solid rgba(255,255,255,0.08);
+      transition: border-color 0.2s;
+    }
+    .model-card:hover { border-color: rgba(94, 211, 243, 0.4); }
+    .model-card.selected { border-color: var(--cyan); background: rgba(94, 211, 243, 0.08); }
+    .model-card .model-name { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
+    .model-card .model-meta { font-size: 12px; color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; }
+    .model-card .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11px;
+      background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+    }
+    .model-card .badge.yes { color: var(--good); border-color: rgba(47,210,127,0.3); }
+    .model-card .badge.no { color: var(--muted); }
+    .deploy-controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin: 14px 0; }
+    .deploy-controls label { font-size: 13px; color: var(--muted); }
+    .deploy-controls select, .deploy-controls input[type=number] {
+      background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.15);
+      color: var(--text); padding: 6px 10px; border-radius: 8px; font-family: inherit; font-size: 13px;
+    }
+    .deploy-controls input[type=checkbox] { accent-color: var(--cyan); }
+    details { margin: 10px 0; }
+    details summary {
+      cursor: pointer; color: var(--muted); font-size: 13px; padding: 6px 0;
+      user-select: none;
+    }
+    details[open] summary { color: var(--cyan); }
+    .advanced-grid { display: flex; flex-wrap: wrap; gap: 14px; padding: 10px 0; }
+    .btn {
+      padding: 10px 24px; border-radius: 10px; font-family: inherit; font-size: 14px;
+      font-weight: 700; cursor: pointer; border: none; transition: all 0.2s;
+    }
+    .btn-deploy {
+      background: linear-gradient(135deg, #2fd27f, #1ba865); color: #0a0f16;
+    }
+    .btn-deploy:hover { transform: translateY(-1px); box-shadow: 0 4px 20px rgba(47,210,127,0.4); }
+    .btn-deploy:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
+    .btn-cancel {
+      background: rgba(255,107,107,0.2); color: var(--bad); border: 1px solid rgba(255,107,107,0.3);
+    }
+    .btn-cancel:hover { background: rgba(255,107,107,0.3); }
+    .btn-refresh {
+      background: rgba(94,211,243,0.1); color: var(--cyan); border: 1px solid rgba(94,211,243,0.2);
+      padding: 6px 14px; font-size: 12px;
+    }
+    .btn-refresh:hover { background: rgba(94,211,243,0.2); }
+    .deploy-progress {
+      margin-top: 14px; padding: 14px; border-radius: 14px;
+      background: rgba(5,8,14,0.8); border: 1px solid rgba(255,255,255,0.08);
+    }
+    .deploy-progress .step-indicator {
+      display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+      font-size: 14px; font-weight: 600;
+    }
+    .spinner {
+      width: 16px; height: 16px; border: 2px solid rgba(94,211,243,0.3);
+      border-top-color: var(--cyan); border-radius: 50%;
+      animation: spin 0.8s linear infinite; display: inline-block;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .deploy-log {
+      max-height: 400px; overflow-y: auto; padding: 10px; border-radius: 10px;
+      background: rgba(0,0,0,0.4); font-size: 12px; line-height: 1.5;
+      color: #b8d4c8; white-space: pre-wrap; word-break: break-all;
+    }
+    .result-banner {
+      padding: 10px 16px; border-radius: 10px; margin-top: 10px;
+      font-weight: 600; font-size: 14px;
+    }
+    .result-banner.success { background: rgba(47,210,127,0.15); color: var(--good); border: 1px solid rgba(47,210,127,0.3); }
+    .result-banner.failed { background: rgba(255,107,107,0.15); color: var(--bad); border: 1px solid rgba(255,107,107,0.3); }
     @media (max-width: 960px) {
       .wrap { padding: 16px; }
       th:first-child, td:first-child { width: 118px; min-width: 118px; }
       .endpoint-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
-    @media (max-width: 640px) {
-      .endpoint-grid { grid-template-columns: 1fr; }
-    }
+    @media (max-width: 640px) { .endpoint-grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
-  <div class=\"wrap\">
-    <section class=\"hero\">
-      <div class=\"hero-main\">
+  <div class="wrap">
+    <section class="hero">
+      <div class="hero-main">
         <div>
-          <h1>rz-rpc-llm monitor</h1>
-          <p>Single-port gateway on <code>/monitor</code> for the same developer loop as <code>./deploy.sh monitor</code>: health, throughput, rolling history, and the last 5 log lines.</p>
+          <h1>rz-rpc-llm</h1>
+          <p>Management portal — deploy models, monitor performance, and manage the LLM inference stack.</p>
         </div>
-        <div class=\"meta\" id=\"meta\"></div>
+        <div class="meta" id="meta"></div>
       </div>
     </section>
 
-    <section class=\"cards\" id=\"cards\"></section>
+    <!-- Deploy Panel -->
+    <section class="panel deploy-section" id="deploy-panel">
+      <h2>Deploy</h2>
+      <div id="model-list" class="model-cards"></div>
+      <div class="deploy-controls" id="deploy-controls">
+        <label>Mode:
+          <select id="mode-select">
+            <option value="">Auto (default)</option>
+            <option value="solo">Solo (Mac only)</option>
+            <option value="distributed">Distributed (Mac + DGX)</option>
+          </select>
+        </label>
+        <label id="vision-label" style="display:none">
+          <input type="checkbox" id="vision-check"> Vision
+        </label>
+        <label>Tag:
+          <select id="tag-select"><option value="">Current</option></select>
+        </label>
+        <button class="btn btn-refresh" onclick="loadTags()">Refresh Tags</button>
+        <details id="advanced">
+          <summary>Advanced Options</summary>
+          <div class="advanced-grid">
+            <label>Context: <input type="number" id="ctx-input" placeholder="default" style="width:90px"></label>
+            <label>Parallel: <input type="number" id="parallel-input" placeholder="default" style="width:70px"></label>
+            <label><input type="checkbox" id="skip-clone"> Skip clone</label>
+            <label><input type="checkbox" id="skip-build"> Skip build</label>
+            <label><input type="checkbox" id="skip-download"> Skip download</label>
+          </div>
+        </details>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center">
+        <button class="btn btn-deploy" id="deploy-btn" onclick="startDeploy()">Deploy</button>
+        <span id="deploy-hint" style="font-size:12px;color:var(--muted)">Select a model to deploy</span>
+      </div>
+      <div id="deploy-progress" style="display:none" class="deploy-progress">
+        <div class="step-indicator">
+          <span class="spinner" id="deploy-spinner"></span>
+          <span id="deploy-step">Initializing...</span>
+          <button class="btn btn-cancel" onclick="cancelDeploy()">Cancel</button>
+        </div>
+        <div class="deploy-log" id="deploy-log"></div>
+        <div id="deploy-result"></div>
+      </div>
+    </section>
 
-    <section class=\"panel edge\">
+    <!-- Monitor -->
+    <section class="cards" id="cards"></section>
+    <section class="panel edge">
       <h2>Rolling History</h2>
-      <div class=\"history-note\">20 minute view with denser samples near the present. New samples land on the right edge and the oldest buckets fall away on the left.</div>
-      <div class=\"history\"><table id=\"history\"></table></div>
+      <div class="history-note">20 minute view with denser samples near the present.</div>
+      <div class="history"><table id="history"></table></div>
     </section>
-
-    <section class=\"panel\" style=\"margin-top: 16px;\">
+    <section class="panel" style="margin-top: 16px;">
       <h2>Live Log</h2>
-      <pre class=\"log\" id=\"log\"></pre>
+      <pre class="log" id="log"></pre>
     </section>
-
-    <section class=\"panel\" style=\"margin-top: 16px;\">
+    <section class="panel" style="margin-top: 16px;">
       <h2>Endpoints</h2>
-      <div class=\"endpoint-list endpoint-grid\" id=\"endpoints\"></div>
+      <div class="endpoint-list endpoint-grid" id="endpoints"></div>
     </section>
-    <div class=\"footer\" id=\"footer\"></div>
+    <div class="footer" id="footer"></div>
   </div>
   <script>
     const HISTORY_WINDOW_SECONDS = 20 * 60;
     let lastData = null;
+    let selectedModel = null;
+    let modelsData = [];
+    let eventSource = null;
+
+    // --- Model loading ---
+    async function loadModels() {
+      try {
+        const res = await fetch('/api/models');
+        modelsData = await res.json();
+        const container = document.getElementById('model-list');
+        container.innerHTML = modelsData.map(m => `
+          <div class="model-card" data-id="${m.id}" onclick="selectModel('${m.id}')">
+            <div class="model-name">${m.display_name || m.id}</div>
+            <div class="model-meta">
+              <span class="badge">${m.default_mode}</span>
+              <span class="badge ${m.solo === 'yes' ? 'yes' : 'no'}">solo: ${m.solo}</span>
+              <span class="badge ${m.vision === 'yes' ? 'yes' : 'no'}">vision: ${m.vision}</span>
+              <span class="badge">ctx: ${Number(m.ctx_size || 0).toLocaleString()}</span>
+              <span class="badge">parallel: ${m.parallel || '?'}</span>
+            </div>
+          </div>
+        `).join('');
+      } catch (e) { console.error('loadModels:', e); }
+    }
+
+    function selectModel(id) {
+      selectedModel = id;
+      document.querySelectorAll('.model-card').forEach(c => c.classList.toggle('selected', c.dataset.id === id));
+      const m = modelsData.find(x => x.id === id);
+      if (!m) return;
+      // Update mode options
+      const modeSelect = document.getElementById('mode-select');
+      const soloOpt = modeSelect.querySelector('[value=solo]');
+      if (soloOpt) soloOpt.disabled = m.solo !== 'yes';
+      // Set mode to model's default
+      if (m.default_mode === 'solo') modeSelect.value = 'solo';
+      else if (m.default_mode === 'distributed') modeSelect.value = 'distributed';
+      else modeSelect.value = '';
+      // Vision toggle
+      const visionLabel = document.getElementById('vision-label');
+      visionLabel.style.display = m.vision === 'yes' ? '' : 'none';
+      document.getElementById('vision-check').checked = m.vision === 'yes';
+      // Populate defaults in advanced options
+      document.getElementById('ctx-input').value = m.ctx_size || '';
+      document.getElementById('ctx-input').placeholder = m.ctx_size || 'default';
+      document.getElementById('parallel-input').value = m.parallel || '';
+      document.getElementById('parallel-input').placeholder = m.parallel || 'default';
+      // Reset tag and skip options
+      document.getElementById('tag-select').value = '';
+      document.getElementById('skip-clone').checked = false;
+      document.getElementById('skip-build').checked = false;
+      document.getElementById('skip-download').checked = false;
+      document.getElementById('deploy-hint').textContent = `Ready to deploy ${m.display_name || m.id}`;
+      document.getElementById('deploy-hint').style.color = 'var(--muted)';
+      document.getElementById('deploy-btn').disabled = false;
+    }
+
+    // --- Tag loading ---
+    async function loadTags() {
+      try {
+        const btn = document.querySelector('.btn-refresh');
+        btn.textContent = 'Loading...';
+        btn.disabled = true;
+        const res = await fetch('/api/tags');
+        const tags = await res.json();
+        const sel = document.getElementById('tag-select');
+        sel.innerHTML = '<option value="">Current</option>' + tags.map(t => `<option value="${t}">${t}</option>`).join('');
+        btn.textContent = 'Refresh Tags';
+        btn.disabled = false;
+      } catch (e) {
+        console.error('loadTags:', e);
+        document.querySelector('.btn-refresh').textContent = 'Refresh Tags';
+        document.querySelector('.btn-refresh').disabled = false;
+      }
+    }
+
+    // --- Deployment ---
+    async function startDeploy() {
+      if (!selectedModel) return;
+      const m = modelsData.find(x => x.id === selectedModel);
+      const mode = document.getElementById('mode-select').value;
+      const vision = document.getElementById('vision-check').checked;
+      const tag = document.getElementById('tag-select').value;
+      const modeLabel = mode || m.default_mode || 'auto';
+      if (!confirm(`Deploy ${m.display_name || m.id} in ${modeLabel} mode?`)) return;
+
+      const body = {
+        model: selectedModel,
+        mode: mode || m.default_mode || '',
+        vision: vision,
+        tag: tag,
+        ctx: document.getElementById('ctx-input').value || '',
+        parallel: document.getElementById('parallel-input').value || '',
+        skip_clone: document.getElementById('skip-clone').checked,
+        skip_build: document.getElementById('skip-build').checked,
+        skip_download: document.getElementById('skip-download').checked,
+      };
+
+      try {
+        const res = await fetch('/api/deploy', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+        if (res.status === 409) { alert('A deployment is already in progress.'); return; }
+        if (!res.ok) { alert('Deploy failed to start'); return; }
+        showDeployProgress();
+        streamDeployLogs();
+      } catch (e) { alert('Deploy error: ' + e); }
+    }
+
+    function showDeployProgress() {
+      document.getElementById('deploy-progress').style.display = '';
+      document.getElementById('deploy-log').textContent = '';
+      document.getElementById('deploy-result').innerHTML = '';
+      document.getElementById('deploy-btn').disabled = true;
+      document.getElementById('deploy-spinner').style.display = '';
+    }
+
+    function streamDeployLogs() {
+      if (eventSource) eventSource.close();
+      eventSource = new EventSource('/api/deploy/stream');
+      const logEl = document.getElementById('deploy-log');
+      eventSource.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        if (data.done) {
+          eventSource.close();
+          eventSource = null;
+          document.getElementById('deploy-spinner').style.display = 'none';
+          document.getElementById('deploy-btn').disabled = false;
+          const resultEl = document.getElementById('deploy-result');
+          if (data.status === 'success') {
+            resultEl.innerHTML = '<div class="result-banner success">Deployment successful</div>';
+            // Auto-collapse after success
+            setTimeout(() => {
+              document.getElementById('deploy-progress').style.display = 'none';
+              document.getElementById('deploy-hint').textContent = 'Last deployment succeeded';
+              document.getElementById('deploy-hint').style.color = 'var(--green, #22c55e)';
+            }, 3000);
+          } else {
+            resultEl.innerHTML = '<div class="result-banner failed">Deployment failed</div>';
+          }
+          return;
+        }
+        if (data.step) document.getElementById('deploy-step').textContent = data.step;
+        if (data.line !== undefined) {
+          logEl.textContent += data.line + '\n';
+          logEl.scrollTop = logEl.scrollHeight;
+        }
+      };
+      eventSource.onerror = () => {
+        // Auto-reconnect is built into EventSource; if terminal, close
+        if (eventSource && eventSource.readyState === 2) {
+          eventSource.close();
+          eventSource = null;
+          document.getElementById('deploy-spinner').style.display = 'none';
+          document.getElementById('deploy-btn').disabled = false;
+        }
+      };
+    }
+
+    async function cancelDeploy() {
+      if (!confirm('Cancel the running deployment?')) return;
+      await fetch('/api/deploy/cancel', { method: 'POST' });
+    }
+
+    // --- Check deploy status on load (reconnect if mid-deploy) ---
+    async function checkDeployStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const st = await res.json();
+        if (st.status === 'deploying') {
+          showDeployProgress();
+          document.getElementById('deploy-step').textContent = st.step || 'deploying...';
+          streamDeployLogs();
+        }
+      } catch (e) {}
+    }
+
+    // --- Monitor (existing logic) ---
     const baseRows = [
       ["Mac RAM used", "mac_ram"],
       ["Mac GPU util", "mac_gpu"],
@@ -485,13 +1032,12 @@ INDEX_HTML = """<!doctype html>
     function stateClass(value, key) {
       if (value === "UP") return "good";
       if (value === "DOWN") return "bad";
-      // Context length coloring: parse "  12K" or " 1234" style values
       if (key && key.startsWith("slot_ctx_")) {
         const s = String(value).trim();
         if (s === "--") return "";
         let tokens = 0;
-        const mK = s.match(/(\\d+)K/);
-        const mM = s.match(/(\\d+)M/);
+        const mK = s.match(/(\d+)K/);
+        const mM = s.match(/(\d+)M/);
         if (mK) tokens = Number(mK[1]) * 1000;
         else if (mM) tokens = Number(mM[1]) * 1000000;
         else tokens = Number(s) || 0;
@@ -500,7 +1046,7 @@ INDEX_HTML = """<!doctype html>
         return "bad";
       }
       if (typeof value === "string" && value.includes("%")) {
-        const match = value.match(/(\\d+)%/);
+        const match = value.match(/(\d+)%/);
         if (match) {
           const pct = Number(match[1]);
           if (pct < 50) return "good";
@@ -512,7 +1058,7 @@ INDEX_HTML = """<!doctype html>
     }
 
     function card(label, value) {
-      return `<div class=\"card\"><div class=\"label\">${label}</div><div class=\"value ${String(value).length > 9 ? "small" : ""} ${stateClass(value)}\">${value}</div></div>`;
+      return `<div class="card"><div class="label">${label}</div><div class="value ${String(value).length > 9 ? "small" : ""} ${stateClass(value)}">${value}</div></div>`;
     }
 
     function historyColumnCount() {
@@ -526,23 +1072,19 @@ INDEX_HTML = """<!doctype html>
         if (seconds >= 60) return `-${Math.round(seconds / 60)}m`;
         return `-${Math.round(seconds)}s`;
       };
-
       if (!history.length) {
         return Array.from({ length: count }, (_, index) => ({
           label: formatAge((((count - index) / count) ** 2) * HISTORY_WINDOW_SECONDS),
           empty: true,
         }));
       }
-
       const now = history[history.length - 1].captured_at;
-
       if (history.length <= count) {
         return history.map((entry) => ({
           ...entry,
           label: formatAge(Math.max(0, Math.round(now - entry.captured_at))),
         }));
       }
-
       return Array.from({ length: count }, (_, index) => {
         const progress = count === 1 ? 1 : index / (count - 1);
         const weighted = 1 - ((1 - progress) ** 2);
@@ -555,14 +1097,14 @@ INDEX_HTML = """<!doctype html>
       });
     }
 
-    function render(data) {
+    function renderMonitor(data) {
       const latest = data.latest;
       document.getElementById("meta").innerHTML = [
         ["mode", latest.mode],
         ["updated", latest.timestamp],
         ["llama", latest.llama_server],
         ["rpc", latest.rpc_server],
-      ].map(([k, v]) => `<div class=\"pill\"><span class=\"dot ${stateClass(v)}\"></span>${k}: ${v}</div>`).join("");
+      ].map(([k, v]) => `<div class="pill"><span class="dot ${stateClass(v)}"></span>${k}: ${v}</div>`).join("");
 
       document.getElementById("cards").innerHTML = [
         card("pp (t/s)", latest.pp),
@@ -581,14 +1123,14 @@ INDEX_HTML = """<!doctype html>
       const history = historyBuckets(rawHistory, historyColumnCount());
       document.getElementById("history").innerHTML =
         `<thead><tr><th>metric</th>${history.map((h) => `<th>${h.label}</th>`).join("")}</tr></thead>` +
-        `<tbody>${visibleRows.map(([label, key]) => `<tr><td>${label}</td>${history.map((h) => { const v = h.empty ? "--" : (h[key] == null ? "--" : h[key]); return `<td class=\"${h.empty || v === "--" ? "" : stateClass(v, key)}\">${v}</td>`; }).join("")}</tr>`).join("")}</tbody>`;
+        `<tbody>${visibleRows.map(([label, key]) => `<tr><td>${label}</td>${history.map((h) => { const v = h.empty ? "--" : (h[key] == null ? "--" : h[key]); return `<td class="${h.empty || v === "--" ? "" : stateClass(v, key)}">${v}</td>`; }).join("")}</tr>`).join("")}</tbody>`;
 
       document.getElementById("endpoints").innerHTML = Object.entries(latest.endpoints)
-        .map(([k, v]) => `<div class=\"endpoint-item\"><div class=\"label\">${k}</div><a href=\"${String(v).startsWith("http") ? v : "#"}\" target=\"_blank\">${v}</a></div>`)
+        .map(([k, v]) => `<div class="endpoint-item"><div class="label">${k}</div><a href="${String(v).startsWith("http") ? v : "#"}" target="_blank">${v}</a></div>`)
         .join("");
 
-      document.getElementById("log").textContent = latest.log_lines.join("\\n") || "No llama-server log yet.";
-      document.getElementById("footer").textContent = `Single-port gateway • polling /monitor/api every 3s • ${rawHistory.length} raw samples across the last 20 minutes • ${history.length} visible history buckets`;
+      document.getElementById("log").textContent = latest.log_lines.join("\n") || "No llama-server log yet.";
+      document.getElementById("footer").textContent = `Single-port gateway \u2022 polling /monitor/api every 3s \u2022 ${rawHistory.length} raw samples \u2022 ${history.length} visible buckets`;
     }
 
     async function refresh() {
@@ -596,22 +1138,29 @@ INDEX_HTML = """<!doctype html>
         const res = await fetch('/monitor/api', { cache: 'no-store' });
         const data = await res.json();
         lastData = data;
-        render(data);
+        renderMonitor(data);
       } catch (err) {
         document.getElementById("footer").textContent = `Monitor fetch failed: ${err}`;
       }
     }
 
+    // --- Init ---
+    document.getElementById('deploy-btn').disabled = true;
+    loadModels();
+    loadTags();
+    checkDeployStatus();
     refresh();
     setInterval(refresh, 3000);
-    window.addEventListener("resize", () => {
-      if (lastData) render(lastData);
-    });
+    window.addEventListener("resize", () => { if (lastData) renderMonitor(lastData); });
   </script>
 </body>
 </html>
 """
 
+
+# ---------------------------------------------------------------------------
+# Proxy + /v1/models interception
+# ---------------------------------------------------------------------------
 
 def proxy_request(handler):
     body = b""
@@ -638,6 +1187,18 @@ def proxy_request(handler):
     finally:
         connection.close()
 
+    # Intercept /v1/models to inject rz-llm-default alias
+    if handler.command == "GET" and handler.path.rstrip("/") == "/v1/models":
+        try:
+            models_json = json.loads(payload)
+            if isinstance(models_json.get("data"), list) and models_json["data"]:
+                alias = dict(models_json["data"][0])
+                alias["id"] = "rz-llm-default"
+                models_json["data"].append(alias)
+                payload = json.dumps(models_json).encode("utf-8")
+        except Exception:
+            pass
+
     handler.send_response(response.status, response.reason)
     excluded = {"connection", "transfer-encoding", "content-length", "server", "date"}
     for key, value in response.getheaders():
@@ -649,32 +1210,95 @@ def proxy_request(handler):
         handler.wfile.write(payload)
 
 
+# ---------------------------------------------------------------------------
+# HTTP Handler
+# ---------------------------------------------------------------------------
+
+def _json_response(handler, data, status=200):
+    body = json.dumps(data, indent=2).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _html_response(handler, html):
+    body = html.encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self):
-        if self.path in ("/monitor", "/monitor/"):
-            body = INDEX_HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        path = self.path.split("?")[0].rstrip("/") or "/"
+
+        # Portal
+        if path in ("/", "/monitor"):
+            _html_response(self, PORTAL_HTML)
             return
-        if self.path in ("/monitor/api", "/monitor/api/"):
+
+        # Monitor API (unchanged)
+        if path == "/monitor/api":
             latest = take_snapshot()
-            body = json.dumps({"latest": latest, "history": list(HISTORY)}, indent=2).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            _json_response(self, {"latest": latest, "history": list(HISTORY)})
             return
+
+        # Portal API
+        if path == "/api/models":
+            _json_response(self, parse_models_conf())
+            return
+
+        if path == "/api/tags":
+            _json_response(self, get_llama_tags())
+            return
+
+        if path == "/api/status":
+            _json_response(self, DEPLOY.to_dict())
+            return
+
+        if path == "/api/deploy/stream":
+            handle_deploy_stream(self)
+            return
+
+        # Proxy everything else
         proxy_request(self)
 
     def do_POST(self):
+        path = self.path.split("?")[0].rstrip("/")
+
+        if path == "/api/deploy":
+            raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            try:
+                params = json.loads(raw)
+            except Exception:
+                _json_response(self, {"error": "invalid JSON"}, 400)
+                return
+            if not params.get("model"):
+                _json_response(self, {"error": "model required"}, 400)
+                return
+            deploy_id = str(uuid.uuid4())[:8]
+            if not DEPLOY.start(params["model"], deploy_id):
+                _json_response(self, {"error": "deployment already in progress"}, 409)
+                return
+            thread = threading.Thread(target=run_deployment, args=(params,), daemon=True)
+            thread.start()
+            _json_response(self, {"deploy_id": deploy_id, "status": "deploying"}, 202)
+            return
+
+        if path == "/api/deploy/cancel":
+            DEPLOY.cancel()
+            _json_response(self, {"status": "cancelled"})
+            return
+
+        # Proxy everything else
         proxy_request(self)
 
     def do_OPTIONS(self):
@@ -699,7 +1323,7 @@ def main():
             port = int(args[index + 1])
     take_snapshot()
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"monitor-web gateway listening on http://{host}:{port}/monitor -> {BACKEND_BASE_URL}", flush=True)
+    print(f"monitor-web gateway listening on http://{host}:{port}/ -> {BACKEND_BASE_URL}", flush=True)
     server.serve_forever()
 
 

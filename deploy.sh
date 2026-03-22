@@ -7,6 +7,7 @@
 #   - Solo:        Mac Studio alone
 #
 # Usage: ./deploy.sh <command> [options]
+#   managed                          Web portal — deploy, monitor, redeploy from browser
 #   run --model NAME [--vision] [--solo|--distributed] [--tag TAG] [--ctx N]
 #                    [--parallel N] [--skip-clone] [--skip-build] [--skip-download]
 #   stop                             Stop all services
@@ -764,14 +765,16 @@ _launch_llama_server() {
     while (( elapsed < limit )); do
         if curl -sf "http://127.0.0.1:${LLAMA_BACKEND_PORT}/health" &>/dev/null; then
             echo
-            cmd_stop_monitor_web >/dev/null 2>&1 || true
-            cmd_start_monitor_web >/dev/null
+            if [[ "${SKIP_MONITOR_RESTART:-}" != "1" ]]; then
+                cmd_stop_monitor_web >/dev/null 2>&1 || true
+                cmd_start_monitor_web >/dev/null
+            fi
             log_ok "llama-server ready in ${elapsed}s"
             log_ok "OpenAI-compatible endpoint: http://127.0.0.1:${LLAMA_PORT}/v1"
             log_ok "Monitor UI: http://127.0.0.1:${LLAMA_PORT}/monitor"
             log_ok "Metrics: http://127.0.0.1:${LLAMA_PORT}/metrics"
             log "Log: ${log_file}"
-            if [[ "${MONITOR_AFTER_START}" == "1" ]]; then
+            if [[ "${MONITOR_AFTER_START}" == "1" ]] && [[ "${SKIP_MONITOR_RESTART:-}" != "1" ]]; then
                 echo
                 cmd_monitor
             fi
@@ -793,21 +796,24 @@ _launch_llama_server() {
 }
 
 # ------------------------------------------------------------------------------
-# Command: start-llama (legacy, used by debug)
+# Command: start-llama
 # ------------------------------------------------------------------------------
 cmd_start_llama() {
-    local model_file="" model_alias="" ctx_size="" parallel=""
-    local vision_mode="" monitor_mode="" latest_mode=""
+    local model_name="" model_file="" model_alias="" ctx_size="" parallel=""
+    local vision_mode="" mode_override="" monitor_mode="" latest_mode=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --model-file|-m) model_file="$2";  shift 2 ;;
-            --alias|-a)      model_alias="$2"; shift 2 ;;
-            --ctx|-c)        ctx_size="$2";    shift 2 ;;
-            --parallel|-p)   parallel="$2";    shift 2 ;;
-            --vision|-v)     vision_mode="1"; shift ;;
-            --monitor)       monitor_mode="1"; shift ;;
-            --latest)        latest_mode="1"; shift ;;
+            --model|-m)      model_name="$2";  shift 2 ;;
+            --model-file)    model_file="$2";   shift 2 ;;
+            --alias|-a)      model_alias="$2";  shift 2 ;;
+            --ctx|-c)        ctx_size="$2";     shift 2 ;;
+            --parallel|-p)   parallel="$2";     shift 2 ;;
+            --vision|-v)     vision_mode="1";   shift ;;
+            --solo)          mode_override="solo"; shift ;;
+            --distributed)   mode_override="distributed"; shift ;;
+            --monitor)       monitor_mode="1";  shift ;;
+            --latest)        latest_mode="1";   shift ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -821,12 +827,18 @@ cmd_start_llama() {
         cmd_build_mac
     fi
 
-    # Map legacy --vision flag to model registry
-    if [[ -n "${vision_mode}" ]]; then
+    if [[ -n "${model_name}" ]]; then
+        # Modern path: --model NAME from model registry
+        load_model_registry "${model_name}"
+        resolve_run_mode "${mode_override}"
+        VISION_ACTIVE="${vision_mode}"
+    elif [[ -n "${vision_mode}" ]]; then
+        # Legacy path: --vision defaults to qwen3.5
         load_model_registry "qwen3.5-122b"
         RUNTIME_MODE="solo"
         VISION_ACTIVE="1"
     else
+        # Legacy path: default to minimax distributed
         load_model_registry "minimax-m2.5"
         RUNTIME_MODE="distributed"
         VISION_ACTIVE=""
@@ -1659,6 +1671,58 @@ cmd_monitor() {
 }
 
 # ------------------------------------------------------------------------------
+# Command: managed — long-running web portal mode
+# ------------------------------------------------------------------------------
+cmd_managed() {
+    load_config
+
+    # 1. Establish SSH ControlMaster (prompts for password)
+    log_section "Connecting to DGX Spark"
+    log "Establishing SSH connection to ${DGX_USER}@${DGX_HOST}..."
+    ssh -o "StrictHostKeyChecking=accept-new" \
+        -o "ControlMaster=yes" \
+        -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+        -o "ControlPersist=yes" \
+        "${DGX_USER}@${DGX_HOST}" echo "SSH OK"
+    log_ok "SSH ControlMaster established"
+
+    # 2. Start monitor-web portal
+    cmd_stop_monitor_web 2>/dev/null || true
+    cmd_start_monitor_web
+
+    local portal_host="${MONITOR_WEB_HOST}"
+    [[ "${portal_host}" == "0.0.0.0" ]] && portal_host="127.0.0.1"
+    log_ok "Portal ready at http://${portal_host}:${MONITOR_WEB_PORT}/"
+    log "Press Ctrl+C to stop all services and exit"
+
+    # 3. Trap Ctrl+C — full cleanup
+    trap '
+        echo
+        log_warn "Shutting down..."
+        cmd_stop_llama 2>/dev/null || true
+        cmd_stop_rpc 2>/dev/null || true
+        cmd_stop_monitor_web 2>/dev/null || true
+        ssh -O exit -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+            "${DGX_USER}@${DGX_HOST}" 2>/dev/null || true
+        log_ok "All services stopped. Goodbye."
+        exit 0
+    ' INT TERM
+
+    # 4. Block forever — keep SSH alive with periodic check
+    while true; do
+        sleep 30
+        ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+            "${DGX_USER}@${DGX_HOST}" 2>/dev/null || {
+            log_warn "SSH connection lost, reconnecting..."
+            ssh -o "ControlMaster=yes" \
+                -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+                -o "ControlPersist=yes" \
+                "${DGX_USER}@${DGX_HOST}" echo "SSH reconnected" 2>/dev/null || true
+        }
+    done
+}
+
+# ------------------------------------------------------------------------------
 # Command: status
 # ------------------------------------------------------------------------------
 cmd_status() {
@@ -1760,10 +1824,14 @@ ${BOLD}USAGE${RESET}
   ./deploy.sh <command> [options]
 
 ${BOLD}COMMANDS${RESET}
+  ${CYAN}managed${RESET}  ${GREEN}(recommended)${RESET}
+       Web management portal — deploy, monitor, and redeploy from browser.
+       Prompts for DGX SSH password, keeps connection alive. Ctrl+C stops all.
+
   ${CYAN}run${RESET}      --model NAME [--vision] [--solo|--distributed] [--tag TAG]
                           [--ctx N] [--parallel N]
                           [--skip-clone] [--skip-build] [--skip-download]
-       Full pipeline: clone → build → download → start → monitor
+       CLI pipeline: clone → build → download → start → terminal monitor
        ${GREEN}--model${RESET}        Model from models.conf (case-insensitive)
        ${GREEN}--vision${RESET}       Enable vision mode (model must support it)
        ${GREEN}--solo${RESET}         Force solo mode (Mac only)
@@ -1791,10 +1859,13 @@ ${BOLD}COMMANDS${RESET}
        start-llama, stop-llama, start-monitor-web, stop-monitor-web
 
 ${BOLD}EXAMPLES${RESET}
-  ${BOLD}# Vision model (Qwen3.5, Mac solo):${RESET}
+  ${BOLD}# Web portal (recommended):${RESET}
+  ./deploy.sh managed
+
+  ${BOLD}# CLI: Vision model (Qwen3.5, Mac solo):${RESET}
   ./deploy.sh run --model qwen3.5 --vision
 
-  ${BOLD}# Distributed text (MiniMax, Mac + DGX):${RESET}
+  ${BOLD}# CLI: Distributed text (MiniMax, Mac + DGX):${RESET}
   ./deploy.sh run --model minimax
 
   ${BOLD}# Pin a specific llama.cpp version:${RESET}
@@ -1832,6 +1903,7 @@ main() {
         status)  cmd_status "$@" ;;
         logs)    cmd_logs "$@" ;;
         monitor) cmd_monitor "$@" ;;
+        managed) cmd_managed "$@" ;;
         models)  list_models ;;
         debug)   cmd_debug "$@" ;;
         # Deprecated — warn and forward
