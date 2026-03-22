@@ -1005,17 +1005,17 @@ PORTAL_HTML = r"""<!doctype html>
 
     // --- Monitor (existing logic) ---
     const baseRows = [
-      ["Mac RAM used", "mac_ram"],
-      ["Mac GPU util", "mac_gpu"],
-      ["DGX RAM used", "dgx_ram", "DISTRIBUTED"],
-      ["DGX GPU util", "dgx_gpu", "DISTRIBUTED"],
-      ["rpc-server", "rpc_server", "DISTRIBUTED"],
       ["llama-server", "llama_server"],
+      ["rpc-server", "rpc_server", "DISTRIBUTED"],
+      ["Mac RAM used", "mac_ram"],
+      ["DGX RAM used", "dgx_ram", "DISTRIBUTED"],
+      ["Mac GPU util", "mac_gpu"],
+      ["DGX GPU util", "dgx_gpu", "DISTRIBUTED"],
+      ["prompt tokens", "prompt_tokens"],
+      ["gen tokens", "gen_tokens"],
       ["pp (t/s)", "pp"],
       ["tg (t/s)", "tg"],
       ["reqs", "reqs"],
-      ["prompt tokens", "prompt_tokens"],
-      ["gen tokens", "gen_tokens"],
     ];
 
     let maxSlotsSeen = 0;
@@ -1194,6 +1194,7 @@ def proxy_request(handler):
             if isinstance(models_json.get("data"), list) and models_json["data"]:
                 alias = dict(models_json["data"][0])
                 alias["id"] = "rz-llm-default"
+                alias["owned_by"] = "roundzero-ai"
                 models_json["data"].append(alias)
                 payload = json.dumps(models_json).encode("utf-8")
         except Exception:
