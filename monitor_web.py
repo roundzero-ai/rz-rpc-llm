@@ -128,7 +128,6 @@ def dgx_snapshot():
     remote = (
         "echo \"MEM:$(free -m 2>/dev/null | awk '/^Mem:/{printf \"%d %d\", $3, $2}')\"; "
         "echo \"GPU_UTIL:$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')\"; "
-        "echo \"GPU_MEM:$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)\"; "
         "echo \"RPC:$(pgrep -x rpc-server >/dev/null 2>&1 && echo UP || echo DOWN)\""
     )
     cmd = [
@@ -147,7 +146,6 @@ def dgx_snapshot():
 
     mem = re.search(r"^MEM:(\d+) (\d+)$", out, re.MULTILINE)
     gpu_util = re.search(r"^GPU_UTIL:(.*)$", out, re.MULTILINE)
-    gpu_mem = re.search(r"^GPU_MEM:(.*)$", out, re.MULTILINE)
     rpc = re.search(r"^RPC:(.*)$", out, re.MULTILINE)
     ram = "--"
     gpu = "--"
@@ -158,13 +156,8 @@ def dgx_snapshot():
         if total > 0:
             ram = f"{(used * 100) // total}%"
 
-    if gpu_mem and gpu_mem.group(1).strip():
-        parts = [p.strip() for p in gpu_mem.group(1).split(",")]
-        if len(parts) >= 1 and parts[0].isdigit():
-            used_mb = int(parts[0])
-            gpu = f"{(gpu_util.group(1).strip() if gpu_util else '?')}%/{used_mb // 1024}G"
-    elif gpu_util and gpu_util.group(1).strip():
-        gpu = f"{gpu_util.group(1).strip()}%/UMA"
+    if gpu_util and gpu_util.group(1).strip():
+        gpu = f"{gpu_util.group(1).strip()}%"
 
     return {"ram": ram, "gpu": gpu, "rpc": (rpc.group(1).strip() if rpc else "--")}
 
@@ -579,7 +572,7 @@ INDEX_HTML = """<!doctype html>
         card("gen tokens", latest.gen_tokens),
         card("mac ram", latest.mac_ram),
         card("mac gpu", latest.mac_gpu),
-        ...(latest.mode === "DISTRIBUTED" ? [card("dgx ram", latest.dgx_ram), card("dgx gpu", latest.dgx_gpu)] : []),
+        ...(latest.mode === "DISTRIBUTED" ? [card("dgx ram", latest.dgx_ram), card("dgx gpu util", latest.dgx_gpu)] : []),
       ].join("");
 
       const rows = buildRows(latest);

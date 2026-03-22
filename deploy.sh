@@ -1308,7 +1308,6 @@ cmd_monitor() {
                 ds="$(ssh_dgx bash -c "'
                     echo \"MEM:\$(free -m 2>/dev/null | awk \"/^Mem:/{printf \\\"%d %d\\\", \\\$3, \\\$2}\")\"
                     echo \"GPU_UTIL:\$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d \" \")\"
-                    echo \"GPU_MEM:\$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)\"
                     echo \"RPC:\$(pgrep -x rpc-server >/dev/null 2>&1 && echo UP || echo DOWN)\"
                 '" 2>/dev/null || true)"
                 if [[ -n "${ds}" ]]; then
@@ -1320,15 +1319,10 @@ cmd_monitor() {
                             v2="$(printf "%dG/%d%%" "$(( dm / 1024 ))" "$(( dm * 100 / dt ))")"
                         fi
                     fi
-                    local gu gm
+                    local gu
                     gu="$(echo "${ds}" | grep '^GPU_UTIL:' | sed 's/^GPU_UTIL://')"
-                    gm="$(echo "${ds}" | grep '^GPU_MEM:' | sed 's/^GPU_MEM://')"
-                    if [[ "${gm}" =~ ^[0-9] ]]; then
-                        local mu2 mt2; IFS=', ' read -r mu2 mt2 <<< "${gm}"
-                        local gm_gb; gm_gb="$(echo "scale=0; ${mu2} / 1024" | bc)"
-                        v3="$(printf "%s%%/%dG" "${gu:-?}" "${gm_gb}")"
-                    elif [[ -n "${gu}" ]]; then
-                        v3="${gu}%/UMA"
+                    if [[ -n "${gu}" ]]; then
+                        v3="${gu}%"
                     fi
                     v4="$(echo "${ds}" | grep '^RPC:' | sed 's/^RPC://')"
                 fi
@@ -1490,6 +1484,36 @@ cmd_monitor() {
                         | awk -F'=' '{print $NF}' | head -1 || true)"
                     [[ -n "${mgu}" ]] && v1="${mgu}%"
 
+                    # DGX metrics (distributed mode)
+                    v2="--"; v3="--"; v4="--"
+                    if [[ "${monitor_mode}" == "DISTRIBUTED" ]]; then
+                        if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+                                "${DGX_USER}@${DGX_HOST}" &>/dev/null 2>&1; then
+                            local ds=""
+                            ds="$(ssh_dgx bash -c "'
+                                echo \"MEM:\$(free -m 2>/dev/null | awk \"/^Mem:/{printf \\\"%d %d\\\", \\\$3, \\\$2}\")\"
+                                echo \"GPU_UTIL:\$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d \" \")\"
+                                echo \"RPC:\$(pgrep -x rpc-server >/dev/null 2>&1 && echo UP || echo DOWN)\"
+                            '" 2>/dev/null || true)"
+                            if [[ -n "${ds}" ]]; then
+                                local ml; ml="$(echo "${ds}" | grep '^MEM:' | sed 's/^MEM://')"
+                                if [[ -n "${ml}" ]]; then
+                                    local dm dt
+                                    read -r dm dt <<< "${ml}"
+                                    if [[ -n "${dt}" ]] && (( dt > 0 )); then
+                                        v2="$(printf "%dG/%d%%" "$(( dm / 1024 ))" "$(( dm * 100 / dt ))")"
+                                    fi
+                                fi
+                                local gu
+                                gu="$(echo "${ds}" | grep '^GPU_UTIL:' | sed 's/^GPU_UTIL://')"
+                                if [[ -n "${gu}" ]]; then
+                                    v3="${gu}%"
+                                fi
+                                v4="$(echo "${ds}" | grep '^RPC:' | sed 's/^RPC://')"
+                            fi
+                        fi
+                    fi
+
                     # llama-server metrics
                     local met pp_val tg_val reqs_val prompt_total pred_total
                     v5="DOWN"; v6="--"; v7="--"; v8="--"; v9="--"; v10="--"
@@ -1514,8 +1538,8 @@ cmd_monitor() {
                     snap+=("${v0}|${v1}|${v2}|${v3}|${v4}|${v5}|${v6}|${v7}|${v8}|${v9}|${v10}")
                 fi
 
-                # Draw full screen from top (cursor to home)
-                printf "\033[H"
+                # Draw full screen from top (clear + home)
+                printf "\033[H\033[2J"
                 tput civis 2>/dev/null || true  # hide cursor
 
                 # Rolling table (draw in top portion)

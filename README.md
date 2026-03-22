@@ -324,7 +324,15 @@ For this hybrid attention+SSM model (12 full-attention layers out of 48), the KV
 
 All of this competes with the ~105 GB model weight reads on every decode step. The monitor's `ctx s0` row tracks this in real time so you can correlate tg drops with context growth.
 
-**5. `--defrag-thold` is deprecated in recent llama.cpp.**
+**5. `--batch-size` and `--ubatch-size` are fine at defaults (2048 / 512).**
+
+`batch_size` is the logical maximum tokens per `llama_decode` call (application level). `ubatch_size` is the physical chunk size sent to the GPU per iteration (device level). During prompt processing, the engine splits the prompt into `ubatch_size`-token chunks — so a 40K prompt with `ubatch_size=512` runs ~78 GPU iterations.
+
+Increasing `ubatch_size` reduces the number of iterations (and kernel launch overhead), but the gains are marginal because kernel launches are cheap relative to the actual compute. More importantly, the user-visible bottleneck is token generation (tg), not prompt processing (pp) — and batch/ubatch settings have no effect on tg speed. For distributed mode, larger ubatches reduce RPC round-trips but the data transferred per trip scales proportionally, so total transfer time is roughly constant.
+
+We tested and kept the upstream defaults: `batch_size=2048`, `ubatch_size=512` for both models.
+
+**6. `--defrag-thold` is deprecated in recent llama.cpp.**
 
 Newer versions handle KV cache defragmentation automatically. The flag is accepted but ignored. We keep it for backward compatibility.
 
@@ -339,6 +347,8 @@ Newer versions handle KV cache defragmentation automatically. The flag is accept
 | `--threads` | 8 | 14 | Solo: fewer threads = less GPU bandwidth contention |
 | `--kv-unified` | on | on | Shared KV pool across slots |
 | `--flash-attn` | on | on | Required for efficient long-context attention |
+| `--batch-size` | 2048 | 2048 | Logical token cap per decode call; headroom for continuous batching |
+| `--ubatch-size` | 512 | 512 | GPU compute chunk; upstream default, marginal gains from increasing |
 | `--cache-type-k/v` | q8_0 | q8_0 | Good quality; q4_0 would halve KV bandwidth at quality cost |
 
 ## Build details
