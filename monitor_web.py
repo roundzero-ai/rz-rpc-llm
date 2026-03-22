@@ -28,10 +28,8 @@ DGX_RPC_PORT = os.environ.get("DGX_RPC_PORT", "50052")
 CONTROL_PATH = str(PID_DIR / "ssh-dgx.ctl")
 HISTORY = deque(maxlen=512)
 HISTORY_WINDOW_SECONDS = 20 * 60
-# Per-slot tracking: remember task id and prompt token count for each active request
-# so we can compute total KV context = prompt_tokens + n_decoded.
-_slot_state = {}  # slot_id -> {"task_id": int, "prompt_tokens": int}
-_prev_prompt_total = 0.0  # running total of prompt tokens across all requests
+# Cache of task_id -> prompt token count, parsed from llama-server log.
+_task_prompt_tokens = {}  # task_id -> n_tokens from "new prompt" log line
 
 
 def run(cmd, timeout=4):
@@ -51,14 +49,17 @@ def fetch_text(url, timeout=2):
 
 
 def format_compact_number(value):
+    """Format a number to at most 5 chars: 999, 1.2K, 12K, 100K, 1.2M, 12M."""
     try:
         value = float(value)
     except Exception:
         return "--"
     if value >= 1_000_000:
-        return f"{value / 1_000_000:.1f}M"
+        v = value / 1_000_000
+        return f"{v:.0f}M" if v >= 10 else f"{v:.1f}M"
     if value >= 1_000:
-        return f"{value / 1_000:.1f}K"
+        v = value / 1_000
+        return f"{v:.0f}K" if v >= 10 else f"{v:.1f}K"
     return str(int(value))
 
 
@@ -169,28 +170,54 @@ def dgx_snapshot():
 
 
 def format_ctx_compact(n):
-    """Format a token count into at most 5 chars: e.g. 1234 -> '1234', 12345 -> ' 12K', 131072 -> '131K'."""
+    """Format a token count into at most 5 chars: e.g. 1234 -> '1234', 12345 -> '12K', 131072 -> '131K'."""
     try:
         n = int(n)
     except Exception:
-        return "  --"
+        return "--"
     if n <= 0:
-        return "    0"
+        return "0"
     if n < 10000:
-        return f"{n:>5d}"
+        return str(n)
     if n < 1_000_000:
-        return f"{n // 1000:>4d}K"
-    return f"{n // 1_000_000:>4d}M"
+        return f"{n // 1000}K"
+    return f"{n // 1_000_000}M"
 
 
-def slots_snapshot(health, prompt_total):
+_NEW_PROMPT_RE = re.compile(
+    r"id\s+(\d+)\s*\|\s*task\s+(\d+)\s*\|.*new prompt.*task\.n_tokens\s*=\s*(\d+)"
+)
+
+
+def _refresh_task_prompt_cache():
+    """Scan the last portion of llama-server.log for 'new prompt' lines
+    and cache task_id -> prompt token count."""
+    log_file = LOG_DIR / "llama-server.log"
+    if not log_file.exists():
+        return
+    try:
+        # Read last 64KB — enough to cover recent requests
+        size = log_file.stat().st_size
+        with open(log_file, "r", errors="replace") as f:
+            if size > 65536:
+                f.seek(size - 65536)
+                f.readline()  # skip partial line
+            for line in f:
+                m = _NEW_PROMPT_RE.search(line)
+                if m:
+                    task_id = int(m.group(2))
+                    n_tokens = int(m.group(3))
+                    _task_prompt_tokens[task_id] = n_tokens
+    except Exception:
+        pass
+
+
+def slots_snapshot(health):
     """Query /slots and return per-slot context info.
 
-    Uses prompt_tokens_total delta to estimate the prompt size when a slot
-    starts processing a new task, so we can report total KV context
-    (prompt_tokens + n_decoded) per slot.
+    Looks up prompt token count from the llama-server log (parsed from
+    "new prompt" lines) and adds n_decoded to get total KV context.
     """
-    global _slot_state, _prev_prompt_total
     if not health:
         return []
     raw = fetch_text(f"{BACKEND_BASE_URL}/slots", timeout=4)
@@ -200,8 +227,8 @@ def slots_snapshot(health, prompt_total):
         slots = json.loads(raw)
     except Exception:
         return []
+    _refresh_task_prompt_cache()
     result = []
-    pt = prompt_total or 0.0
     for s in slots:
         sid = s.get("id", 0)
         active = s.get("is_processing", False)
@@ -209,29 +236,17 @@ def slots_snapshot(health, prompt_total):
         n_decoded = nt.get("n_decoded", 0)
         task_id = s.get("id_task", -1)
 
-        prev = _slot_state.get(sid, {})
-        prompt_n = prev.get("prompt_tokens", 0)
+        if active:
+            prompt_n = _task_prompt_tokens.get(task_id, 0)
+            total_ctx = prompt_n + n_decoded
+        else:
+            total_ctx = 0
 
-        if active and task_id != prev.get("task_id"):
-            # New task on this slot — derive prompt tokens from the
-            # cumulative counter delta since last snapshot.
-            # This is approximate when multiple slots start simultaneously
-            # but good enough for monitoring.
-            prompt_n = max(0, int(pt - _prev_prompt_total))
-            _slot_state[sid] = {
-                "task_id": task_id,
-                "prompt_tokens": prompt_n,
-            }
-        elif not active:
-            prompt_n = 0
-
-        total_ctx = prompt_n + n_decoded
         result.append({
             "id": sid,
             "active": active,
             "ctx": total_ctx,
         })
-    _prev_prompt_total = pt
     return result
 
 
@@ -243,11 +258,11 @@ def llama_snapshot():
     reqs = parse_metric(metrics, "llamacpp:requests_processing")
     prompt_total = parse_metric(metrics, "llamacpp:prompt_tokens_total", as_float=True)
     gen_total = parse_metric(metrics, "llamacpp:tokens_predicted_total", as_float=True)
-    slots = slots_snapshot(health, prompt_total)
+    slots = slots_snapshot(health)
     return {
         "status": "UP" if health else "DOWN",
-        "pp": f"{pp:.1f}" if pp is not None else "--",
-        "tg": f"{tg:.1f}" if tg is not None else "--",
+        "pp": (f"{pp:.0f}" if pp >= 100 else f"{pp:.1f}") if pp is not None else "--",
+        "tg": (f"{tg:.0f}" if tg >= 100 else f"{tg:.1f}") if tg is not None else "--",
         "reqs": reqs if reqs is not None else "--",
         "prompt_tokens": format_compact_number(prompt_total) if prompt_total is not None else "--",
         "gen_tokens": format_compact_number(gen_total) if gen_total is not None else "--",
@@ -279,7 +294,7 @@ def take_snapshot():
         if s["active"]:
             slot_fields[f"slot_ctx_{sid}"] = format_ctx_compact(s["ctx"])
         else:
-            slot_fields[f"slot_ctx_{sid}"] = "  --"
+            slot_fields[f"slot_ctx_{sid}"] = "--"
     snapshot = {
         "captured_at": now,
         "timestamp": subprocess.run(["date", "+%H:%M:%S"], capture_output=True, text=True).stdout.strip(),
