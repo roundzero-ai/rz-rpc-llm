@@ -595,17 +595,17 @@ cmd_start_llama() {
         esac
     done
 
+    # Vision mode auto-enables monitor
+    [[ -n "${vision_mode}" ]] && monitor_mode="1"
+
+    load_config
+
     # --latest: fetch the latest llama.cpp tag, rebuild, then start
     if [[ -n "${latest_mode}" ]]; then
         log_section "Updating llama.cpp to latest tag"
         cmd_clone --tag latest
         cmd_build_mac
     fi
-
-    # Vision mode auto-enables monitor
-    [[ -n "${vision_mode}" ]] && monitor_mode="1"
-
-    load_config
 
     if [[ -n "${vision_mode}" ]]; then
         model_file="${model_file:-${DEFAULT_VISION_MODEL_FILE}}"
