@@ -211,7 +211,7 @@ cp config.env.example config.env
 Typical overrides:
 
 ```bash
-DGX_HOST="192.168.86.242"
+DGX_HOST="192.168.88.66"
 DGX_USER="your_user"
 ```
 

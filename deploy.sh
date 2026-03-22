@@ -98,6 +98,9 @@ load_config() {
     [[ -n "${env_dgx_remote_dir}" ]] && DGX_REMOTE_DIR="${env_dgx_remote_dir}"
     [[ -n "${env_hf_token}" ]] && HF_TOKEN="${env_hf_token}"
 
+    # Derive DGX_REMOTE_DIR from DGX_USER if not explicitly set
+    DGX_REMOTE_DIR="${DGX_REMOTE_DIR:-/home/${DGX_USER}/rz-rpc-llm/llama.cpp}"
+
     # Expand relative paths relative to SCRIPT_DIR
     if [[ "${LLAMA_CPP_DIR}" != /* ]]; then
         LLAMA_CPP_DIR="${SCRIPT_DIR}/${LLAMA_CPP_DIR#./}"
