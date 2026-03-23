@@ -135,16 +135,71 @@ def parse_models_conf():
     return models
 
 
+def _format_age(seconds):
+    if seconds < 3600:
+        return f"{int(seconds / 60)}m ago"
+    elif seconds < 86400:
+        return f"{int(seconds / 3600)}h ago"
+    else:
+        return f"{int(seconds / 86400)}d ago"
+
+
 def get_llama_tags():
     llama_dir = ROOT / "llama.cpp"
     if not (llama_dir / ".git").is_dir():
         return []
     run_cmd(["git", "-C", str(llama_dir), "fetch", "--tags", "--prune"], timeout=30)
-    code, out, _ = run_cmd(["git", "-C", str(llama_dir), "tag", "--sort=-version:refname"], timeout=10)
+
+    # Find current tag
+    current_tag = None
+    rc, desc, _ = run_cmd(["git", "-C", str(llama_dir), "describe", "--tags", "--exact-match", "HEAD"], timeout=5)
+    if rc == 0 and desc.strip():
+        current_tag = desc.strip()
+
+    # Get b* tags with their creation time
+    code, out, _ = run_cmd([
+        "git", "-C", str(llama_dir),
+        "for-each-ref", "--sort=-version:refname",
+        "--format=%(refname:short) %(creatordate:unix)",
+        "refs/tags/b[0-9]*",
+    ], timeout=10)
     if code != 0:
         return []
-    tags = [t.strip() for t in out.splitlines() if t.strip()]
-    return tags[:50]
+
+    now = time.time()
+    three_days = 3 * 86400
+    results = []
+    current_entry = None
+
+    for line in out.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        tag, ts = parts[0], parts[1]
+        try:
+            age = now - float(ts)
+        except ValueError:
+            continue
+        age_label = _format_age(age)
+        is_current = tag == current_tag
+        entry = {
+            "tag": tag,
+            "label": f"[current] {tag} ({age_label})" if is_current else f"{tag} ({age_label})",
+            "current": is_current,
+        }
+        if is_current:
+            current_entry = entry
+        # Cap: within 3 days or top 5, whichever is more
+        if age <= three_days or len(results) < 5:
+            results.append(entry)
+        else:
+            break
+
+    # Ensure current tag is always included
+    if current_entry and current_entry not in results:
+        results.append(current_entry)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -621,14 +676,16 @@ PORTAL_HTML = r"""<!doctype html>
     .hero h1 { margin: 0; font-size: clamp(24px, 4vw, 40px); }
     .hero p { margin: 0; color: var(--muted); max-width: 72ch; }
     .meta { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
-    .cards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); margin: 18px 0; }
+    .cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
     .card, .panel {
-      background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
-      padding: 16px; box-shadow: var(--shadow); backdrop-filter: blur(14px);
+      background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+      padding: 10px 12px; box-shadow: var(--shadow); backdrop-filter: blur(14px);
     }
-    .label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-    .value { margin-top: 8px; font-size: 28px; font-weight: 700; }
-    .value.small { font-size: 20px; }
+    .card { flex: 1 1 0; min-width: 90px; }
+    .label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+    .value { margin-top: 4px; font-size: 18px; font-weight: 700; }
+    .value.small { font-size: 15px; }
+    .panel { border-radius: 18px; padding: 16px; }
     .pill {
       display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px;
       border-radius: 999px; background: rgba(255,255,255,0.04); border: 1px solid var(--line);
@@ -779,7 +836,7 @@ PORTAL_HTML = r"""<!doctype html>
           <input type="checkbox" id="vision-check"> Vision
         </label>
         <label>Tag:
-          <select id="tag-select"><option value="">Current</option></select>
+          <select id="tag-select"><option value="">Loading...</option></select>
         </label>
         <button class="btn btn-refresh" onclick="loadTags()">Refresh Tags</button>
         <details id="advanced">
@@ -795,6 +852,7 @@ PORTAL_HTML = r"""<!doctype html>
       </div>
       <div style="display:flex;gap:12px;align-items:center">
         <button class="btn btn-deploy" id="deploy-btn" onclick="startDeploy()">Deploy</button>
+        <button class="btn btn-cancel" id="undeploy-btn" onclick="undeploy()">Undeploy</button>
         <span id="deploy-hint" style="font-size:12px;color:var(--muted)">Select a model to deploy</span>
       </div>
       <div id="deploy-progress" style="display:none" class="deploy-progress">
@@ -875,8 +933,9 @@ PORTAL_HTML = r"""<!doctype html>
       document.getElementById('ctx-input').placeholder = m.ctx_size || 'default';
       document.getElementById('parallel-input').value = m.parallel || '';
       document.getElementById('parallel-input').placeholder = m.parallel || 'default';
-      // Reset tag and skip options
-      document.getElementById('tag-select').value = '';
+      // Reset tag to current and skip options
+      const curOpt = Array.from(document.getElementById('tag-select').options).find(o => o.textContent.startsWith('[current]'));
+      document.getElementById('tag-select').value = curOpt ? curOpt.value : '';
       document.getElementById('skip-clone').checked = false;
       document.getElementById('skip-build').checked = false;
       document.getElementById('skip-download').checked = false;
@@ -894,7 +953,9 @@ PORTAL_HTML = r"""<!doctype html>
         const res = await fetch('/api/tags');
         const tags = await res.json();
         const sel = document.getElementById('tag-select');
-        sel.innerHTML = '<option value="">Current</option>' + tags.map(t => `<option value="${t}">${t}</option>`).join('');
+        const current = tags.find(t => t.current);
+        sel.innerHTML = tags.map(t => `<option value="${t.tag}"${t.current ? ' selected' : ''}>${t.label}</option>`).join('');
+        if (!current && tags.length) sel.value = tags[0].tag;
         btn.textContent = 'Refresh Tags';
         btn.disabled = false;
       } catch (e) {
@@ -988,6 +1049,22 @@ PORTAL_HTML = r"""<!doctype html>
     async function cancelDeploy() {
       if (!confirm('Cancel the running deployment?')) return;
       await fetch('/api/deploy/cancel', { method: 'POST' });
+    }
+
+    async function undeploy() {
+      if (!confirm('Stop llama-server and rpc-server?')) return;
+      document.getElementById('undeploy-btn').disabled = true;
+      document.getElementById('undeploy-btn').textContent = 'Stopping...';
+      try {
+        const res = await fetch('/api/undeploy', { method: 'POST' });
+        const data = await res.json();
+        document.getElementById('deploy-hint').textContent = data.message || 'Servers stopped';
+        document.getElementById('deploy-hint').style.color = 'var(--muted)';
+      } catch (e) {
+        alert('Undeploy error: ' + e);
+      }
+      document.getElementById('undeploy-btn').disabled = false;
+      document.getElementById('undeploy-btn').textContent = 'Undeploy';
     }
 
     // --- Check deploy status on load (reconnect if mid-deploy) ---
@@ -1301,6 +1378,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/deploy/cancel":
             DEPLOY.cancel()
             _json_response(self, {"status": "cancelled"})
+            return
+
+        if path == "/api/undeploy":
+            stopped = []
+            env = dict(os.environ, TERM="dumb", SKIP_MONITOR_RESTART="1")
+            for name, step in [("llama-server", "stop-llama"), ("rpc-server", "stop-rpc")]:
+                try:
+                    r = subprocess.run(
+                        ["bash", DEPLOY_SCRIPT, "debug", step],
+                        capture_output=True, text=True, timeout=60, env=env,
+                    )
+                    if r.returncode == 0:
+                        stopped.append(name)
+                except Exception:
+                    pass
+            msg = f"Stopped: {', '.join(stopped)}" if stopped else "No servers were running"
+            _json_response(self, {"status": "ok", "stopped": stopped, "message": msg})
             return
 
         # Proxy everything else

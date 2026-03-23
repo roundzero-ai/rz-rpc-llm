@@ -867,6 +867,17 @@ cmd_stop_llama() {
         pid="$(cat "${pid_file}")"
         if kill -0 "${pid}" 2>/dev/null; then
             kill "${pid}"
+            # Wait for process to fully exit and release memory
+            local waited=0
+            while kill -0 "${pid}" 2>/dev/null && (( waited < 30 )); do
+                sleep 1
+                (( waited += 1 ))
+            done
+            if kill -0 "${pid}" 2>/dev/null; then
+                log_warn "llama-server (PID ${pid}) did not exit after ${waited}s, sending SIGKILL"
+                kill -9 "${pid}" 2>/dev/null || true
+                sleep 1
+            fi
             rm -f "${pid_file}"
             log_ok "llama-server (PID ${pid}) stopped"
             stopped=1
@@ -877,14 +888,24 @@ cmd_stop_llama() {
     else
         # Fallback: kill by name
         if pgrep -x llama-server &>/dev/null; then
-            pkill -x llama-server && log_ok "llama-server stopped (by name)"
+            pkill -x llama-server
+            local waited=0
+            while pgrep -x llama-server &>/dev/null && (( waited < 30 )); do
+                sleep 1
+                (( waited += 1 ))
+            done
+            if pgrep -x llama-server &>/dev/null; then
+                pkill -9 -x llama-server 2>/dev/null || true
+                sleep 1
+            fi
+            log_ok "llama-server stopped (by name)"
             stopped=1
         else
             log_warn "No llama-server process found"
         fi
     fi
 
-    if [[ "${stopped}" == "1" ]]; then
+    if [[ "${stopped}" == "1" ]] && [[ "${SKIP_MONITOR_RESTART:-}" != "1" ]]; then
         cmd_stop_monitor_web >/dev/null 2>&1 || true
     fi
 }
