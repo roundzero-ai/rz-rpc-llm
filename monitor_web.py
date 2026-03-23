@@ -239,6 +239,8 @@ def run_deployment(params):
     tag = params.get("tag", "")
     ctx = params.get("ctx", "")
     parallel = params.get("parallel", "")
+    split_mode = params.get("split_mode", "")
+    tensor_split = params.get("tensor_split", "")
     skip_clone = params.get("skip_clone", False)
     skip_build = params.get("skip_build", False)
     skip_download = params.get("skip_download", False)
@@ -299,6 +301,10 @@ def run_deployment(params):
             start_cmd.extend(["--ctx", str(ctx)])
         if parallel:
             start_cmd.extend(["--parallel", str(parallel)])
+        if split_mode:
+            start_cmd.extend(["--split-mode", split_mode])
+        if tensor_split:
+            start_cmd.extend(["--tensor-split", tensor_split])
         if not _run_step("start-llama", start_cmd, env):
             DEPLOY.finish(False)
             return
@@ -841,6 +847,40 @@ PORTAL_HTML = r"""<!doctype html>
           <div class="advanced-grid">
             <label>Context: <input type="number" id="ctx-input" placeholder="default" style="width:90px"></label>
             <label>Parallel: <input type="number" id="parallel-input" placeholder="default" style="width:70px"></label>
+            <div id="distributed-opts" style="display:none">
+              <label>Split mode:
+                <select id="split-mode-select">
+                  <option value="layer">layer</option>
+                  <option value="row">row</option>
+                  <option value="none">none</option>
+                </select>
+              </label>
+              <label>Tensor split (DGX:Mac):
+                <select id="tensor-split-select">
+                  <option value="0,20">0:100</option>
+                  <option value="1,19">5:95</option>
+                  <option value="2,18">10:90</option>
+                  <option value="3,17">15:85</option>
+                  <option value="4,16">20:80</option>
+                  <option value="5,15">25:75</option>
+                  <option value="6,14">30:70</option>
+                  <option value="7,13">35:65</option>
+                  <option value="8,12">40:60</option>
+                  <option value="9,11">45:55</option>
+                  <option value="10,10">50:50</option>
+                  <option value="11,9">55:45</option>
+                  <option value="12,8">60:40</option>
+                  <option value="13,7">65:35</option>
+                  <option value="14,6">70:30</option>
+                  <option value="15,5">75:25</option>
+                  <option value="16,4">80:20</option>
+                  <option value="17,3">85:15</option>
+                  <option value="18,2">90:10</option>
+                  <option value="19,1">95:5</option>
+                  <option value="20,0">100:0</option>
+                </select>
+              </label>
+            </div>
             <label><input type="checkbox" id="skip-clone"> Skip clone</label>
             <label><input type="checkbox" id="skip-build"> Skip build</label>
             <label><input type="checkbox" id="skip-download"> Skip download</label>
@@ -930,6 +970,8 @@ PORTAL_HTML = r"""<!doctype html>
       document.getElementById('ctx-input').placeholder = m.ctx_size || 'default';
       document.getElementById('parallel-input').value = m.parallel || '';
       document.getElementById('parallel-input').placeholder = m.parallel || 'default';
+      // Distributed options
+      updateDistributedOpts(modeSelect.value, m);
       // Reset tag to current and skip options
       const curOpt = Array.from(document.getElementById('tag-select').options).find(o => o.textContent.startsWith('[current]'));
       document.getElementById('tag-select').value = curOpt ? curOpt.value : '';
@@ -940,6 +982,27 @@ PORTAL_HTML = r"""<!doctype html>
       document.getElementById('deploy-hint').style.color = 'var(--muted)';
       document.getElementById('deploy-btn').disabled = false;
     }
+
+    function updateDistributedOpts(mode, m) {
+      const show = mode === 'distributed';
+      document.getElementById('distributed-opts').style.display = show ? '' : 'none';
+      if (show) {
+        document.getElementById('split-mode-select').value = m.split_mode || 'layer';
+        const ts = document.getElementById('tensor-split-select');
+        const modelTs = m.tensor_split || '2,3';
+        // Find closest ratio option
+        const parts = modelTs.split(',').map(Number);
+        const pct = Math.round((parts[0] / (parts[0] + parts[1])) * 20);
+        const bestVal = `${pct},${20 - pct}`;
+        const opt = Array.from(ts.options).find(o => o.value === bestVal);
+        ts.value = opt ? bestVal : '8,12';
+      }
+    }
+
+    document.getElementById('mode-select').addEventListener('change', function() {
+      const m = modelsData.find(x => x.id === selectedModel);
+      if (m) updateDistributedOpts(this.value || m.default_mode, m);
+    });
 
     // --- Tag loading ---
     async function loadTags() {
@@ -979,6 +1042,8 @@ PORTAL_HTML = r"""<!doctype html>
         tag: tag,
         ctx: document.getElementById('ctx-input').value || '',
         parallel: document.getElementById('parallel-input').value || '',
+        split_mode: document.getElementById('split-mode-select').value || '',
+        tensor_split: document.getElementById('tensor-split-select').value || '',
         skip_clone: document.getElementById('skip-clone').checked,
         skip_build: document.getElementById('skip-build').checked,
         skip_download: document.getElementById('skip-download').checked,

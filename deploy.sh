@@ -801,19 +801,22 @@ _launch_llama_server() {
 cmd_start_llama() {
     local model_name="" model_file="" model_alias="" ctx_size="" parallel=""
     local vision_mode="" mode_override="" monitor_mode="" latest_mode=""
+    local split_mode_override="" tensor_split_override=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --model|-m)      model_name="$2";  shift 2 ;;
-            --model-file)    model_file="$2";   shift 2 ;;
-            --alias|-a)      model_alias="$2";  shift 2 ;;
-            --ctx|-c)        ctx_size="$2";     shift 2 ;;
-            --parallel|-p)   parallel="$2";     shift 2 ;;
-            --vision|-v)     vision_mode="1";   shift ;;
-            --solo)          mode_override="solo"; shift ;;
-            --distributed)   mode_override="distributed"; shift ;;
-            --monitor)       monitor_mode="1";  shift ;;
-            --latest)        latest_mode="1";   shift ;;
+            --model|-m)       model_name="$2";  shift 2 ;;
+            --model-file)     model_file="$2";   shift 2 ;;
+            --alias|-a)       model_alias="$2";  shift 2 ;;
+            --ctx|-c)         ctx_size="$2";     shift 2 ;;
+            --parallel|-p)    parallel="$2";     shift 2 ;;
+            --split-mode)     split_mode_override="$2"; shift 2 ;;
+            --tensor-split)   tensor_split_override="$2"; shift 2 ;;
+            --vision|-v)      vision_mode="1";   shift ;;
+            --solo)           mode_override="solo"; shift ;;
+            --distributed)    mode_override="distributed"; shift ;;
+            --monitor)        monitor_mode="1";  shift ;;
+            --latest)         latest_mode="1";   shift ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -847,6 +850,8 @@ cmd_start_llama() {
     # Apply overrides
     [[ -n "${model_file}" ]] && MODEL_FILE="${model_file}"
     [[ -n "${model_alias}" ]] && MODEL_ALIAS="${model_alias}"
+    [[ -n "${split_mode_override}" ]] && MODEL_SPLIT_MODE="${split_mode_override}"
+    [[ -n "${tensor_split_override}" ]] && MODEL_TENSOR_SPLIT="${tensor_split_override}"
 
     select_runtime_profile "${ctx_size}" "${parallel}"
     MONITOR_AFTER_START="${monitor_mode}"
