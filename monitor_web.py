@@ -277,14 +277,11 @@ def run_deployment(params):
                 DEPLOY.finish(False)
                 return
 
-        # 5. Stop existing
+        # 5. Stop existing servers (always stop both to handle mode switches)
         _run_step("stop-llama", ["bash", DEPLOY_SCRIPT, "debug", "stop-llama"], env)
+        _run_step("stop-rpc", ["bash", DEPLOY_SCRIPT, "debug", "stop-rpc"], env)
 
-        # 6. Stop RPC if needed
-        if mode == "distributed":
-            _run_step("stop-rpc", ["bash", DEPLOY_SCRIPT, "debug", "stop-rpc"], env)
-
-        # 7. Start RPC if distributed
+        # 6. Start RPC if distributed
         if mode == "distributed":
             if not _run_step("start-rpc", ["bash", DEPLOY_SCRIPT, "debug", "start-rpc"], env):
                 DEPLOY.finish(False)
