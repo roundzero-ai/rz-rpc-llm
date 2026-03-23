@@ -56,8 +56,9 @@ class DeploymentState:
         self.log_cursor = 0
         self.process = None
         self.serving_model = ""
+        self.serving_params = {}
 
-    def start(self, model, deploy_id):
+    def start(self, model, deploy_id, params=None):
         with self.lock:
             if self.status == "deploying":
                 return False
@@ -65,6 +66,7 @@ class DeploymentState:
             self.deploy_id = deploy_id
             self.step = "initializing"
             self.model_name = model
+            self._pending_params = params or {}
             self.started_at = time.time()
             self.log_lines = []
             self.log_cursor = 0
@@ -95,6 +97,7 @@ class DeploymentState:
             self.status = "success" if success else "failed"
             if success:
                 self.serving_model = self.model_name
+                self.serving_params = dict(self._pending_params)
             self.process = None
 
     def cancel(self):
@@ -112,6 +115,7 @@ class DeploymentState:
                 "step": self.step,
                 "model_name": self.model_name,
                 "serving_model": self.serving_model,
+                "serving_params": dict(self.serving_params),
                 "started_at": self.started_at,
                 "elapsed": (time.time() - self.started_at) if self.status == "deploying" else 0,
             }
@@ -599,10 +603,13 @@ def take_snapshot():
             slot_fields[f"slot_ctx_{sid}"] = format_ctx_compact(s["ctx"])
         else:
             slot_fields[f"slot_ctx_{sid}"] = "--"
+    deploy_state = DEPLOY.to_dict()
     snapshot = {
         "captured_at": now,
         "timestamp": subprocess.run(["date", "+%H:%M:%S"], capture_output=True, text=True).stdout.strip(),
         "mode": mode,
+        "serving_model": deploy_state.get("serving_model", ""),
+        "serving_params": deploy_state.get("serving_params", {}),
         "mac_ram": mac_ram_used(),
         "mac_gpu": mac_gpu_util(),
         "dgx_ram": dgx["ram"],
@@ -675,10 +682,13 @@ PORTAL_HTML = r"""<!doctype html>
       background: linear-gradient(135deg, rgba(16,28,45,0.9), rgba(8,14,23,0.84));
       border: 1px solid var(--line); border-radius: 22px; box-shadow: var(--shadow);
     }
-    .hero-main { display: grid; gap: 16px; }
+    .hero-main { display: flex; justify-content: space-between; align-items: start; gap: 16px; flex-wrap: wrap; }
     .hero h1 { margin: 0; font-size: clamp(24px, 4vw, 40px); }
     .hero p { margin: 0; color: var(--muted); max-width: 72ch; }
-    .meta { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+    .hero-status { text-align: right; font-size: 12px; line-height: 1.7; color: var(--muted); white-space: nowrap; }
+    .hero-status .model-name { font-size: 15px; font-weight: 700; color: var(--fg); }
+    .hero-status .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+    .meta { display: flex; flex-wrap: wrap; gap: 8px; }
     .cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
     .card, .panel {
       background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
@@ -817,10 +827,11 @@ PORTAL_HTML = r"""<!doctype html>
       <div class="hero-main">
         <div>
           <h1>rz-rpc-llm</h1>
-          <p>Management portal — deploy models, monitor performance, and manage the LLM inference stack.</p>
+          <p>Management portal</p>
         </div>
-        <div class="meta" id="meta"></div>
+        <div class="hero-status" id="hero-status">No model deployed</div>
       </div>
+      <div class="meta" id="meta"></div>
     </section>
 
     <!-- Deploy Panel -->
@@ -1242,6 +1253,24 @@ PORTAL_HTML = r"""<!doctype html>
 
     function renderMonitor(data) {
       const latest = data.latest;
+      // Hero status — current deployed model
+      const heroEl = document.getElementById("hero-status");
+      if (latest.serving_model && latest.llama_server === "UP") {
+        const p = latest.serving_params || {};
+        const mData = modelsData.find(x => x.id === latest.serving_model);
+        const name = (mData && mData.display_name) || latest.serving_model;
+        const parts = [`<span class="dot good"></span><span class="model-name">${name}</span>`];
+        parts.push(`${latest.mode.toLowerCase()} · ${latest.n_slots || '?'} slots`);
+        if (p.vision) parts.push('vision');
+        if (p.ctx) parts.push(`ctx ${Number(p.ctx).toLocaleString()}`);
+        if (latest.mode === 'DISTRIBUTED' && p.tensor_split) parts.push(`split ${p.tensor_split}`);
+        heroEl.innerHTML = parts.join('<br>');
+      } else if (latest.llama_server === "DOWN") {
+        heroEl.innerHTML = '<span class="dot bad"></span>No model running';
+      } else {
+        heroEl.innerHTML = '<span class="dot"></span>Checking...';
+      }
+
       document.getElementById("meta").innerHTML = [
         ["mode", latest.mode],
         ["updated", latest.timestamp],
@@ -1429,7 +1458,7 @@ class Handler(BaseHTTPRequestHandler):
                 _json_response(self, {"error": "model required"}, 400)
                 return
             deploy_id = str(uuid.uuid4())[:8]
-            if not DEPLOY.start(params["model"], deploy_id):
+            if not DEPLOY.start(params["model"], deploy_id, params):
                 _json_response(self, {"error": "deployment already in progress"}, 409)
                 return
             thread = threading.Thread(target=run_deployment, args=(params,), daemon=True)
@@ -1455,6 +1484,9 @@ class Handler(BaseHTTPRequestHandler):
                         stopped.append(name)
                 except Exception:
                     pass
+            if stopped:
+                DEPLOY.serving_model = ""
+                DEPLOY.serving_params = {}
             msg = f"Stopped: {', '.join(stopped)}" if stopped else "No servers were running"
             _json_response(self, {"status": "ok", "stopped": stopped, "message": msg})
             return
