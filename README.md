@@ -388,6 +388,12 @@ The terminal process is the supervisor. It establishes SSH, starts the portal, a
 
 The portal process (`monitor_web.py`) is protected during web-triggered deploys via `SKIP_MONITOR_RESTART=1` — the pipeline uses individual `debug` steps instead of `run` to avoid restarting the portal mid-deploy.
 
+If you update the portal code while `managed` mode is already running, restart only the web monitor to pick up UI changes:
+
+```bash
+./deploy.sh debug stop-monitor-web && ./deploy.sh debug start-monitor-web
+```
+
 ### CLI mode (`./deploy.sh run`)
 
 Runs the full pipeline sequentially in the terminal, then enters the terminal heartbeat monitor. `Ctrl+C` stops llama-server.

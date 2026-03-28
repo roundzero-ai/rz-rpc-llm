@@ -717,6 +717,16 @@ PORTAL_HTML = r"""<!doctype html>
     .hero-status .model-name { font-size: 15px; font-weight: 700; color: var(--fg); }
     .hero-status .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
     .meta { display: flex; flex-wrap: wrap; gap: 8px; }
+    .status-banner {
+      display: none; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+      padding: 12px 14px; border-radius: 16px;
+      background: linear-gradient(135deg, rgba(255,107,107,0.16), rgba(255,189,69,0.12));
+      border: 1px solid rgba(255,107,107,0.28);
+    }
+    .status-banner.visible { display: flex; }
+    .status-banner-copy { display: grid; gap: 3px; }
+    .status-banner-title { font-size: 13px; font-weight: 700; color: var(--text); letter-spacing: 0.04em; text-transform: uppercase; }
+    .status-banner-text { font-size: 12px; color: var(--muted); }
     .cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
     .card, .panel {
       background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
@@ -859,6 +869,13 @@ PORTAL_HTML = r"""<!doctype html>
         </div>
         <div class="hero-status" id="hero-status">No model deployed</div>
       </div>
+      <div class="status-banner" id="dgx-offline-banner">
+        <div class="status-banner-copy">
+          <div class="status-banner-title">DGX Offline</div>
+          <div class="status-banner-text" id="dgx-offline-text">RPC server offline.</div>
+        </div>
+        <button class="btn btn-refresh" id="retry-dgx-btn" onclick="retryDgxSsh()">Retry DGX SSH</button>
+      </div>
       <div class="meta" id="meta"></div>
     </section>
 
@@ -929,7 +946,6 @@ PORTAL_HTML = r"""<!doctype html>
       <div style="display:flex;gap:12px;align-items:center">
         <button class="btn btn-deploy" id="deploy-btn" onclick="startDeploy()">Deploy</button>
         <button class="btn btn-cancel" id="undeploy-btn" onclick="undeploy()">Undeploy</button>
-        <button class="btn btn-refresh" id="retry-dgx-btn" onclick="retryDgxSsh()">Retry DGX SSH</button>
         <span id="deploy-hint" style="font-size:12px;color:var(--muted)">Select a model to deploy</span>
       </div>
       <div id="deploy-progress" style="display:none" class="deploy-progress">
@@ -1172,18 +1188,22 @@ PORTAL_HTML = r"""<!doctype html>
     async function retryDgxSsh() {
       const btn = document.getElementById('retry-dgx-btn');
       const hint = document.getElementById('deploy-hint');
+      const bannerText = document.getElementById('dgx-offline-text');
       btn.disabled = true;
       btn.textContent = 'Retrying...';
       hint.textContent = 'Retrying DGX SSH...';
       hint.style.color = 'var(--muted)';
+      bannerText.textContent = 'Retrying DGX SSH...';
       try {
         const res = await fetch('/api/dgx/retry-ssh', { method: 'POST' });
         const data = await res.json();
         hint.textContent = data.message || 'DGX SSH retry finished';
         hint.style.color = data.connected ? 'var(--green, #22c55e)' : 'var(--bad, #ff6b6b)';
+        bannerText.textContent = data.message || 'DGX SSH retry finished';
       } catch (e) {
         hint.textContent = 'DGX SSH retry failed';
         hint.style.color = 'var(--bad, #ff6b6b)';
+        bannerText.textContent = 'RPC server offline. Retry DGX SSH failed.';
       }
       btn.disabled = false;
       btn.textContent = 'Retry DGX SSH';
@@ -1302,6 +1322,9 @@ PORTAL_HTML = r"""<!doctype html>
 
     function renderMonitor(data) {
       const latest = data.latest;
+      const dgxBannerEl = document.getElementById('dgx-offline-banner');
+      const dgxBannerTextEl = document.getElementById('dgx-offline-text');
+      const dgxOffline = latest.mode === 'DISTRIBUTED' && latest.rpc_server !== 'UP';
       // Hero status — current deployed model
       const heroEl = document.getElementById("hero-status");
       if (latest.serving_model && latest.llama_server === "UP") {
@@ -1326,6 +1349,15 @@ PORTAL_HTML = r"""<!doctype html>
         ["llama", latest.llama_server],
         ["rpc", latest.rpc_server],
       ].map(([k, v]) => `<div class="pill"><span class="dot ${stateClass(v)}"></span>${k}: ${v}</div>`).join("");
+
+      if (dgxOffline) {
+        dgxBannerEl.classList.add('visible');
+        dgxBannerTextEl.textContent = latest.rpc_server === 'DOWN'
+          ? 'RPC server offline. Retry DGX SSH after the Spark comes back.'
+          : `RPC server status: ${latest.rpc_server}. Retry DGX SSH to restore the DGX connection.`;
+      } else {
+        dgxBannerEl.classList.remove('visible');
+      }
 
       document.getElementById("cards").innerHTML = [
         card("pp (t/s)", latest.pp),
