@@ -514,6 +514,22 @@ def retry_dgx_ssh(timeout=20):
     return False, f"RPC server offline ({detail})"
 
 
+def current_backend_model():
+    raw = fetch_text(f"{BACKEND_BASE_URL}/v1/models", timeout=3)
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return ""
+    data = payload.get("data") or []
+    for item in data:
+        model_id = (item or {}).get("id", "")
+        if model_id and model_id != "rz-llm-default":
+            return model_id
+    return ""
+
+
 def format_ctx_compact(n):
     try:
         n = int(n)
@@ -632,11 +648,13 @@ def take_snapshot():
         else:
             slot_fields[f"slot_ctx_{sid}"] = "--"
     deploy_state = DEPLOY.to_dict()
+    backend_model = current_backend_model() if llama.get("status") == "UP" else ""
     snapshot = {
         "captured_at": now,
         "timestamp": subprocess.run(["date", "+%H:%M:%S"], capture_output=True, text=True).stdout.strip(),
         "mode": mode,
         "serving_model": deploy_state.get("serving_model", ""),
+        "backend_model": backend_model,
         "serving_params": deploy_state.get("serving_params", {}),
         "mac_ram": mac_ram_used(),
         "mac_gpu": mac_gpu_util(),
@@ -897,7 +915,7 @@ PORTAL_HTML = r"""<!doctype html>
         <label>Tag:
           <select id="tag-select"><option value="">Loading...</option></select>
         </label>
-        <button class="btn btn-refresh" onclick="loadTags()">Refresh Tags</button>
+        <button class="btn btn-refresh" id="refresh-tags-btn" onclick="loadTags()">Refresh Tags</button>
         <details id="advanced">
           <summary>Advanced Options</summary>
           <div class="advanced-grid">
@@ -1062,8 +1080,8 @@ PORTAL_HTML = r"""<!doctype html>
 
     // --- Tag loading ---
     async function loadTags() {
+      const btn = document.getElementById('refresh-tags-btn');
       try {
-        const btn = document.querySelector('.btn-refresh');
         btn.textContent = 'Loading...';
         btn.disabled = true;
         const res = await fetch('/api/tags');
@@ -1076,8 +1094,8 @@ PORTAL_HTML = r"""<!doctype html>
         btn.disabled = false;
       } catch (e) {
         console.error('loadTags:', e);
-        document.querySelector('.btn-refresh').textContent = 'Refresh Tags';
-        document.querySelector('.btn-refresh').disabled = false;
+        btn.textContent = 'Refresh Tags';
+        btn.disabled = false;
       }
     }
 
@@ -1325,18 +1343,23 @@ PORTAL_HTML = r"""<!doctype html>
       const dgxBannerEl = document.getElementById('dgx-offline-banner');
       const dgxBannerTextEl = document.getElementById('dgx-offline-text');
       const dgxOffline = latest.mode === 'DISTRIBUTED' && latest.rpc_server !== 'UP';
+      const currentModelId = latest.serving_model || latest.backend_model || '';
+      const currentModel = currentModelId
+        ? modelsData.find(x => x.id === currentModelId || x.alias === currentModelId)
+        : null;
       // Hero status — current deployed model
       const heroEl = document.getElementById("hero-status");
-      if (latest.serving_model && latest.llama_server === "UP") {
+      if (currentModelId && latest.llama_server === "UP") {
         const p = latest.serving_params || {};
-        const mData = modelsData.find(x => x.id === latest.serving_model);
-        const name = (mData && mData.display_name) || latest.serving_model;
+        const name = (currentModel && currentModel.display_name) || currentModelId;
         const parts = [`<span class="dot good"></span><span class="model-name">${name}</span>`];
         parts.push(`${latest.mode.toLowerCase()} · ${latest.n_slots || '?'} slots`);
         if (p.vision) parts.push('vision');
         if (p.ctx) parts.push(`ctx ${Number(p.ctx).toLocaleString()}`);
         if (latest.mode === 'DISTRIBUTED' && p.tensor_split) parts.push(`split ${p.tensor_split}`);
         heroEl.innerHTML = parts.join('<br>');
+      } else if (latest.llama_server === "UP") {
+        heroEl.innerHTML = `<span class="dot good"></span><span class="model-name">Model running</span><br>${latest.mode.toLowerCase()} · ${latest.n_slots || '?'} slots`;
       } else if (latest.llama_server === "DOWN") {
         heroEl.innerHTML = '<span class="dot bad"></span>No model running';
       } else {

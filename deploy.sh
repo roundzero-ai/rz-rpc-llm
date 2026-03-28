@@ -1048,7 +1048,7 @@ cmd_start_monitor_web() {
 
     local elapsed=0
     while (( elapsed < 20 )); do
-        if curl -sf "http://${monitor_display_host}:${monitor_port}/api/monitor" &>/dev/null; then
+        if curl -sf "http://${monitor_display_host}:${monitor_port}/monitor/api" &>/dev/null; then
             log_ok "monitor-web ready (PID ${monitor_pid})"
             log_ok "Dashboard: http://${monitor_display_host}:${monitor_port}/monitor"
             log "Log: ${log_file}"
@@ -1868,7 +1868,7 @@ cmd_status() {
         local monitor_pid
         monitor_pid="$(cat "${monitor_pid_file}")"
         if kill -0 "${monitor_pid}" 2>/dev/null; then
-            if curl -sf "http://${monitor_check_host}:${MONITOR_WEB_PORT}/api/monitor" &>/dev/null; then
+            if curl -sf "http://${monitor_check_host}:${MONITOR_WEB_PORT}/monitor/api" &>/dev/null; then
                 log_ok "monitor-web   RUNNING  (PID ${monitor_pid}, http://${monitor_check_host}:${MONITOR_WEB_PORT}/monitor)"
             else
                 log_warn "monitor-web   RUNNING  (PID ${monitor_pid}, not responding yet)"
