@@ -331,6 +331,70 @@ check_dgx_ssh() {
     log_ok "DGX SSH connection established — all subsequent commands reuse this session"
 }
 
+managed_check_dgx_ssh() {
+    mkdir -p "${PID_DIR}"
+    if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+            "${DGX_USER}@${DGX_HOST}" &>/dev/null; then
+        log_ok "DGX SSH master already active (${DGX_USER}@${DGX_HOST})"
+        return 0
+    fi
+
+    local timeout_secs="${MANAGED_SSH_TIMEOUT:-20}"
+    local choice=""
+    local choice_lower=""
+    while true; do
+        log "Establishing SSH connection to ${DGX_USER}@${DGX_HOST}..."
+        if python3 - "${timeout_secs}" "${DGX_USER}" "${DGX_HOST}" "${PID_DIR}/ssh-dgx.ctl" <<'PY'
+import subprocess
+import sys
+
+timeout = int(sys.argv[1])
+user = sys.argv[2]
+host = sys.argv[3]
+control_path = sys.argv[4]
+
+cmd = [
+    "ssh",
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "ConnectTimeout=10",
+    "-o", "ConnectionAttempts=1",
+    "-o", "ServerAliveInterval=5",
+    "-o", "ServerAliveCountMax=1",
+    "-o", "ControlMaster=yes",
+    "-o", f"ControlPath={control_path}",
+    "-o", "ControlPersist=yes",
+    f"{user}@{host}",
+    "echo",
+    "SSH OK",
+]
+
+try:
+    completed = subprocess.run(cmd, timeout=timeout)
+except subprocess.TimeoutExpired:
+    print(f"SSH connection timed out after {timeout}s", file=sys.stderr)
+    sys.exit(124)
+
+sys.exit(completed.returncode)
+PY
+        then
+            log_ok "SSH ControlMaster established"
+            return 0
+        fi
+
+        log_warn "DGX SSH is unavailable right now. RPC server will stay offline unless you retry."
+        read -r -p "Press Enter to retry, type 'skip' to continue, or 'abort' to exit: " choice
+        choice_lower="$(printf '%s' "${choice}" | tr '[:upper:]' '[:lower:]')"
+        case "${choice_lower}" in
+            skip|s)
+                return 1
+                ;;
+            abort|a|quit|q)
+                die "Managed mode aborted before portal startup."
+                ;;
+        esac
+    done
+}
+
 # ------------------------------------------------------------------------------
 # Command: clone
 # ------------------------------------------------------------------------------
@@ -1702,15 +1766,19 @@ cmd_monitor() {
 cmd_managed() {
     load_config
 
+    local dgx_bootstrap_skipped=0
+
     # 1. Establish SSH ControlMaster (prompts for password)
-    log_section "Connecting to DGX Spark"
-    log "Establishing SSH connection to ${DGX_USER}@${DGX_HOST}..."
-    ssh -o "StrictHostKeyChecking=accept-new" \
-        -o "ControlMaster=yes" \
-        -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
-        -o "ControlPersist=yes" \
-        "${DGX_USER}@${DGX_HOST}" echo "SSH OK"
-    log_ok "SSH ControlMaster established"
+    if [[ -n "${DGX_HOST:-}" && -n "${DGX_USER:-}" ]]; then
+        log_section "Connecting to DGX Spark"
+        if ! managed_check_dgx_ssh; then
+            dgx_bootstrap_skipped=1
+            log_warn "Starting portal without DGX SSH. RPC server offline."
+        fi
+    else
+        dgx_bootstrap_skipped=1
+        log_warn "DGX SSH config missing — starting portal with RPC server offline."
+    fi
 
     # 2. Start monitor-web portal
     cmd_stop_monitor_web 2>/dev/null || true
@@ -1726,7 +1794,10 @@ cmd_managed() {
         echo
         log_warn "Shutting down..."
         cmd_stop_llama 2>/dev/null || true
-        cmd_stop_rpc 2>/dev/null || true
+        if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+                "${DGX_USER:-nobody}@${DGX_HOST:-localhost}" &>/dev/null 2>&1; then
+            cmd_stop_rpc 2>/dev/null || true
+        fi
         cmd_stop_monitor_web 2>/dev/null || true
         ssh -O exit -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
             "${DGX_USER}@${DGX_HOST}" 2>/dev/null || true
@@ -1739,11 +1810,10 @@ cmd_managed() {
         sleep 30
         ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
             "${DGX_USER}@${DGX_HOST}" 2>/dev/null || {
-            log_warn "SSH connection lost, reconnecting..."
-            ssh -o "ControlMaster=yes" \
-                -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
-                -o "ControlPersist=yes" \
-                "${DGX_USER}@${DGX_HOST}" echo "SSH reconnected" 2>/dev/null || true
+            if (( dgx_bootstrap_skipped == 0 )); then
+                log_warn "SSH connection lost. RPC server offline."
+                dgx_bootstrap_skipped=1
+            fi
         }
     done
 }
@@ -1852,7 +1922,7 @@ ${BOLD}USAGE${RESET}
 ${BOLD}COMMANDS${RESET}
   ${CYAN}managed${RESET}  ${GREEN}(recommended)${RESET}
        Web management portal — deploy, monitor, and redeploy from browser.
-       Prompts for DGX SSH password, keeps connection alive. Ctrl+C stops all.
+       Prompts for DGX SSH password, or lets you skip if DGX is offline. Ctrl+C stops all.
 
   ${CYAN}run${RESET}      --model NAME [--vision] [--solo|--distributed] [--tag TAG]
                           [--ctx N] [--parallel N]

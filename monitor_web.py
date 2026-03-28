@@ -402,12 +402,14 @@ def parse_metric(metrics, name, as_float=False):
 
 
 def detect_mode():
-    if not DGX_HOST or not DGX_USER:
+    serving_mode = (DEPLOY.to_dict().get("serving_params", {}) or {}).get("mode", "")
+    if serving_mode == "solo":
         return "VISION"
-    code, _, _ = run([
-        "ssh", "-O", "check", "-o", f"ControlPath={CONTROL_PATH}", f"{DGX_USER}@{DGX_HOST}"
-    ], timeout=2)
-    return "DISTRIBUTED" if code == 0 else "VISION"
+    if serving_mode == "distributed":
+        return "DISTRIBUTED"
+    if DGX_HOST and DGX_USER:
+        return "DISTRIBUTED"
+    return "VISION"
 
 
 def mac_ram_used():
@@ -484,6 +486,32 @@ def dgx_snapshot():
         gpu = f"{gpu_util.group(1).strip()}%"
 
     return {"ram": ram, "gpu": gpu, "rpc": (rpc.group(1).strip() if rpc else "--")}
+
+
+def retry_dgx_ssh(timeout=20):
+    if not DGX_HOST or not DGX_USER:
+        return False, "DGX SSH config missing"
+    cmd = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=10",
+        "-o", "ConnectionAttempts=1",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=1",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={CONTROL_PATH}",
+        "-o", "ControlPersist=600",
+        f"{DGX_USER}@{DGX_HOST}",
+        "echo",
+        "SSH OK",
+    ]
+    code, out, err = run(cmd, timeout=timeout)
+    if code == 0:
+        return True, f"DGX SSH connected: {DGX_USER}@{DGX_HOST}"
+    detail = (err or out or "RPC server offline").strip()
+    if len(detail) > 240:
+        detail = detail[:237] + "..."
+    return False, f"RPC server offline ({detail})"
 
 
 def format_ctx_compact(n):
@@ -901,6 +929,7 @@ PORTAL_HTML = r"""<!doctype html>
       <div style="display:flex;gap:12px;align-items:center">
         <button class="btn btn-deploy" id="deploy-btn" onclick="startDeploy()">Deploy</button>
         <button class="btn btn-cancel" id="undeploy-btn" onclick="undeploy()">Undeploy</button>
+        <button class="btn btn-refresh" id="retry-dgx-btn" onclick="retryDgxSsh()">Retry DGX SSH</button>
         <span id="deploy-hint" style="font-size:12px;color:var(--muted)">Select a model to deploy</span>
       </div>
       <div id="deploy-progress" style="display:none" class="deploy-progress">
@@ -1138,6 +1167,26 @@ PORTAL_HTML = r"""<!doctype html>
       }
       document.getElementById('undeploy-btn').disabled = false;
       document.getElementById('undeploy-btn').textContent = 'Undeploy';
+    }
+
+    async function retryDgxSsh() {
+      const btn = document.getElementById('retry-dgx-btn');
+      const hint = document.getElementById('deploy-hint');
+      btn.disabled = true;
+      btn.textContent = 'Retrying...';
+      hint.textContent = 'Retrying DGX SSH...';
+      hint.style.color = 'var(--muted)';
+      try {
+        const res = await fetch('/api/dgx/retry-ssh', { method: 'POST' });
+        const data = await res.json();
+        hint.textContent = data.message || 'DGX SSH retry finished';
+        hint.style.color = data.connected ? 'var(--green, #22c55e)' : 'var(--bad, #ff6b6b)';
+      } catch (e) {
+        hint.textContent = 'DGX SSH retry failed';
+        hint.style.color = 'var(--bad, #ff6b6b)';
+      }
+      btn.disabled = false;
+      btn.textContent = 'Retry DGX SSH';
     }
 
     // --- Check deploy status on load (reconnect if mid-deploy) ---
@@ -1489,6 +1538,15 @@ class Handler(BaseHTTPRequestHandler):
                 DEPLOY.serving_params = {}
             msg = f"Stopped: {', '.join(stopped)}" if stopped else "No servers were running"
             _json_response(self, {"status": "ok", "stopped": stopped, "message": msg})
+            return
+
+        if path == "/api/dgx/retry-ssh":
+            connected, message = retry_dgx_ssh()
+            _json_response(self, {
+                "status": "ok" if connected else "offline",
+                "connected": connected,
+                "message": message,
+            }, 200 if connected else 503)
             return
 
         # Proxy everything else
