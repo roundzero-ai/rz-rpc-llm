@@ -1489,7 +1489,6 @@ def proxy_request(handler):
     try:
         connection.request(handler.command, handler.path, body=body, headers=headers)
         response = connection.getresponse()
-        payload = response.read()
     except Exception as exc:
         error = json.dumps({"error": f"backend unavailable: {exc}"}).encode("utf-8")
         handler.send_response(502)
@@ -1498,6 +1497,40 @@ def proxy_request(handler):
         handler.end_headers()
         handler.wfile.write(error)
         return
+
+    content_type = response.getheader("Content-Type", "")
+    is_event_stream = content_type.startswith("text/event-stream")
+
+    if is_event_stream:
+        try:
+            handler.send_response(response.status, response.reason)
+            excluded = {"connection", "transfer-encoding", "content-length", "server", "date"}
+            for key, value in response.getheaders():
+                if key.lower() not in excluded:
+                    handler.send_header(key, value)
+            handler.send_header("Cache-Control", "no-store")
+            handler.send_header("Transfer-Encoding", "chunked")
+            handler.end_headers()
+
+            if handler.command != "HEAD":
+                while True:
+                    chunk = response.read(4096)
+                    if not chunk:
+                        break
+                    handler.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+                    handler.wfile.write(chunk)
+                    handler.wfile.write(b"\r\n")
+                    handler.wfile.flush()
+                handler.wfile.write(b"0\r\n\r\n")
+                handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            connection.close()
+        return
+
+    try:
+        payload = response.read()
     finally:
         connection.close()
 
