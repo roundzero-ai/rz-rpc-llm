@@ -7,7 +7,7 @@
 #   - Solo:        Mac Studio alone
 #
 # Usage: ./deploy.sh <command> [options]
-#   managed                          Web portal — deploy, monitor, redeploy from browser
+#   managed [solo]                   Web portal — deploy, monitor, redeploy from browser
 #   run --model NAME [--vision] [--solo|--distributed] [--tag TAG] [--ctx N]
 #                    [--parallel N] [--skip-clone] [--skip-build] [--skip-download]
 #   stop                             Stop all services
@@ -1032,6 +1032,7 @@ cmd_start_monitor_web() {
     MONITOR_WEB_PORT="${monitor_port}" \
     PID_DIR="${PID_DIR}" \
     LOG_DIR="${LOG_DIR}" \
+    PORTAL_SOLO_ONLY="${MANAGED_SOLO_ONLY:-0}" \
     LLAMA_PORT="${LLAMA_PORT}" \
     LLAMA_BACKEND_HOST="${LLAMA_BACKEND_HOST}" \
     LLAMA_BACKEND_PORT="${LLAMA_BACKEND_PORT}" \
@@ -1766,10 +1767,22 @@ cmd_monitor() {
 cmd_managed() {
     load_config
 
+    local managed_mode="${1:-}"
     local dgx_bootstrap_skipped=0
+    MANAGED_SOLO_ONLY=0
+
+    case "${managed_mode}" in
+        "") ;;
+        solo|--solo) MANAGED_SOLO_ONLY=1 ;;
+        *) die "Unknown managed mode '${managed_mode}'. Use: ./deploy.sh managed [solo]" ;;
+    esac
 
     # 1. Establish SSH ControlMaster (prompts for password)
-    if [[ -n "${DGX_HOST:-}" && -n "${DGX_USER:-}" ]]; then
+    if (( MANAGED_SOLO_ONLY == 1 )); then
+        dgx_bootstrap_skipped=1
+        log_section "Starting Managed Solo Portal"
+        log "Solo-only portal mode enabled: skipping DGX SSH bootstrap and distributed controls"
+    elif [[ -n "${DGX_HOST:-}" && -n "${DGX_USER:-}" ]]; then
         log_section "Connecting to DGX Spark"
         if ! managed_check_dgx_ssh; then
             dgx_bootstrap_skipped=1
@@ -1794,13 +1807,15 @@ cmd_managed() {
         echo
         log_warn "Shutting down..."
         cmd_stop_llama 2>/dev/null || true
-        if ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+        if (( MANAGED_SOLO_ONLY == 0 )) && ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
                 "${DGX_USER:-nobody}@${DGX_HOST:-localhost}" &>/dev/null 2>&1; then
             cmd_stop_rpc 2>/dev/null || true
         fi
         cmd_stop_monitor_web 2>/dev/null || true
-        ssh -O exit -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
-            "${DGX_USER}@${DGX_HOST}" 2>/dev/null || true
+        if (( MANAGED_SOLO_ONLY == 0 )); then
+            ssh -O exit -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+                "${DGX_USER}@${DGX_HOST}" 2>/dev/null || true
+        fi
         log_ok "All services stopped. Goodbye."
         exit 0
     ' INT TERM
@@ -1808,13 +1823,15 @@ cmd_managed() {
     # 4. Block forever — keep SSH alive with periodic check
     while true; do
         sleep 30
-        ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
-            "${DGX_USER}@${DGX_HOST}" 2>/dev/null || {
-            if (( dgx_bootstrap_skipped == 0 )); then
-                log_warn "SSH connection lost. RPC server offline."
-                dgx_bootstrap_skipped=1
-            fi
-        }
+        if (( MANAGED_SOLO_ONLY == 0 )); then
+            ssh -O check -o "ControlPath=${PID_DIR}/ssh-dgx.ctl" \
+                "${DGX_USER}@${DGX_HOST}" 2>/dev/null || {
+                if (( dgx_bootstrap_skipped == 0 )); then
+                    log_warn "SSH connection lost. RPC server offline."
+                    dgx_bootstrap_skipped=1
+                fi
+            }
+        fi
     done
 }
 
@@ -1920,9 +1937,10 @@ ${BOLD}USAGE${RESET}
   ./deploy.sh <command> [options]
 
 ${BOLD}COMMANDS${RESET}
-  ${CYAN}managed${RESET}  ${GREEN}(recommended)${RESET}
+  ${CYAN}managed${RESET} [solo]  ${GREEN}(recommended)${RESET}
        Web management portal — deploy, monitor, and redeploy from browser.
-       Prompts for DGX SSH password, or lets you skip if DGX is offline. Ctrl+C stops all.
+       Default mode prompts for DGX SSH password, or lets you skip if DGX is offline.
+       Use ${GREEN}managed solo${RESET} for Mac-only portal mode with no DGX prompt or distributed options.
 
   ${CYAN}run${RESET}      --model NAME [--vision] [--solo|--distributed] [--tag TAG]
                           [--ctx N] [--parallel N]
@@ -1957,6 +1975,9 @@ ${BOLD}COMMANDS${RESET}
 ${BOLD}EXAMPLES${RESET}
   ${BOLD}# Web portal (recommended):${RESET}
   ./deploy.sh managed
+
+  ${BOLD}# Web portal, Mac-only solo mode:${RESET}
+  ./deploy.sh managed solo
 
   ${BOLD}# CLI: Vision model (Qwen3.5, Mac solo):${RESET}
   ./deploy.sh run --model qwen3.5 --vision

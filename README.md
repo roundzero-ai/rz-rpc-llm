@@ -58,6 +58,7 @@ Each model in `models.conf` declares a default mode and whether solo is allowed.
 |---|---|---|---|---|---|
 | MiniMax-M2.5 | ~180 GB | UD-Q6_K_XL | distributed | no | 2 |
 | Qwen3.5-122B-A10B | ~105 GB | UD-Q6_K_XL | solo | yes | 4 |
+| Qwen3.5-35B-A3B | ~35 GB | Q8_0 | solo | yes | 4 |
 | Qwen3.5-27B | ~17 GB | UD-Q4_K_XL | solo | yes | 8 |
 
 ## Repository layout

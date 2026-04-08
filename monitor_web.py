@@ -28,6 +28,7 @@ BACKEND_SCHEME = BACKEND_PARTS.scheme or "http"
 DGX_HOST = os.environ.get("DGX_HOST", "")
 DGX_USER = os.environ.get("DGX_USER", "")
 DGX_RPC_PORT = os.environ.get("DGX_RPC_PORT", "50052")
+PORTAL_SOLO_ONLY = os.environ.get("PORTAL_SOLO_ONLY", "0") == "1"
 CONTROL_PATH = str(PID_DIR / "ssh-dgx.ctl")
 DEPLOY_SCRIPT = str(ROOT / "deploy.sh")
 HISTORY = deque(maxlen=512)
@@ -134,9 +135,21 @@ def parse_models_conf():
     models = []
     for section in conf.sections():
         m = dict(conf[section])
+        if PORTAL_SOLO_ONLY and m.get("solo") != "yes":
+            continue
         m["id"] = section
+        if PORTAL_SOLO_ONLY:
+            m["default_mode"] = "solo"
         models.append(m)
     return models
+
+
+def get_model_conf(model_id):
+    conf = configparser.ConfigParser()
+    conf.read(str(ROOT / "models.conf"))
+    if conf.has_section(model_id):
+        return dict(conf[model_id])
+    return None
 
 
 def _format_age(seconds):
@@ -239,6 +252,8 @@ def run_deployment(params):
     env = {**os.environ, "TERM": "dumb", "SKIP_MONITOR_RESTART": "1"}
     model = params.get("model", "")
     mode = params.get("mode", "")
+    if PORTAL_SOLO_ONLY:
+        mode = "solo"
     vision = params.get("vision", False)
     tag = params.get("tag", "")
     ctx = params.get("ctx", "")
@@ -285,7 +300,8 @@ def run_deployment(params):
 
         # 5. Stop existing servers (always stop both to handle mode switches)
         _run_step("stop-llama", ["bash", DEPLOY_SCRIPT, "debug", "stop-llama"], env)
-        _run_step("stop-rpc", ["bash", DEPLOY_SCRIPT, "debug", "stop-rpc"], env)
+        if not PORTAL_SOLO_ONLY:
+            _run_step("stop-rpc", ["bash", DEPLOY_SCRIPT, "debug", "stop-rpc"], env)
 
         # 6. Start RPC if distributed
         if mode == "distributed":
@@ -305,9 +321,9 @@ def run_deployment(params):
             start_cmd.extend(["--ctx", str(ctx)])
         if parallel:
             start_cmd.extend(["--parallel", str(parallel)])
-        if split_mode:
+        if mode == "distributed" and split_mode:
             start_cmd.extend(["--split-mode", split_mode])
-        if tensor_split:
+        if mode == "distributed" and tensor_split:
             start_cmd.extend(["--tensor-split", tensor_split])
         if not _run_step("start-llama", start_cmd, env):
             DEPLOY.finish(False)
@@ -403,6 +419,8 @@ def parse_metric(metrics, name, as_float=False):
 
 def detect_mode():
     serving_mode = (DEPLOY.to_dict().get("serving_params", {}) or {}).get("mode", "")
+    if PORTAL_SOLO_ONLY:
+        return "VISION"
     if serving_mode == "solo":
         return "VISION"
     if serving_mode == "distributed":
@@ -489,6 +507,8 @@ def dgx_snapshot():
 
 
 def retry_dgx_ssh(timeout=20):
+    if PORTAL_SOLO_ONLY:
+        return False, "DGX disabled in managed solo mode"
     if not DGX_HOST or not DGX_USER:
         return False, "DGX SSH config missing"
     cmd = [
@@ -902,7 +922,7 @@ PORTAL_HTML = r"""<!doctype html>
       <h2>Deploy</h2>
       <div id="model-list" class="model-cards"></div>
       <div class="deploy-controls" id="deploy-controls">
-        <label>Mode:
+            <label id="mode-label">Mode:
           <select id="mode-select">
             <option value="">Auto (default)</option>
             <option value="solo">Solo (Mac only)</option>
@@ -994,7 +1014,8 @@ PORTAL_HTML = r"""<!doctype html>
     </section>
     <div class="footer" id="footer"></div>
   </div>
-  <script>
+    <script>
+    const PORTAL_SOLO_ONLY = __PORTAL_SOLO_ONLY__;
     const HISTORY_WINDOW_SECONDS = 20 * 60;
     let lastData = null;
     let selectedModel = null;
@@ -1022,6 +1043,16 @@ PORTAL_HTML = r"""<!doctype html>
       } catch (e) { console.error('loadModels:', e); }
     }
 
+    function applyPortalMode() {
+      if (!PORTAL_SOLO_ONLY) return;
+      document.getElementById('mode-label').style.display = 'none';
+      document.getElementById('distributed-opts').style.display = 'none';
+      document.getElementById('dgx-offline-banner').classList.remove('visible');
+      const distributedOpt = document.querySelector('#mode-select option[value="distributed"]');
+      if (distributedOpt) distributedOpt.remove();
+      document.getElementById('mode-select').value = 'solo';
+    }
+
     function selectModel(id) {
       selectedModel = id;
       document.querySelectorAll('.model-card').forEach(c => c.classList.toggle('selected', c.dataset.id === id));
@@ -1031,8 +1062,11 @@ PORTAL_HTML = r"""<!doctype html>
       const modeSelect = document.getElementById('mode-select');
       const soloOpt = modeSelect.querySelector('[value=solo]');
       if (soloOpt) soloOpt.disabled = m.solo !== 'yes';
+      if (PORTAL_SOLO_ONLY) {
+        modeSelect.value = 'solo';
+      }
       // Set mode to model's default
-      if (m.default_mode === 'solo') modeSelect.value = 'solo';
+      else if (m.default_mode === 'solo') modeSelect.value = 'solo';
       else if (m.default_mode === 'distributed') modeSelect.value = 'distributed';
       else modeSelect.value = '';
       // Vision toggle
@@ -1058,7 +1092,7 @@ PORTAL_HTML = r"""<!doctype html>
     }
 
     function updateDistributedOpts(mode, m) {
-      const show = mode === 'distributed';
+      const show = !PORTAL_SOLO_ONLY && mode === 'distributed';
       document.getElementById('distributed-opts').style.display = show ? '' : 'none';
       if (show) {
         document.getElementById('split-mode-select').value = m.split_mode || 'layer';
@@ -1103,7 +1137,7 @@ PORTAL_HTML = r"""<!doctype html>
     async function startDeploy() {
       if (!selectedModel) return;
       const m = modelsData.find(x => x.id === selectedModel);
-      const mode = document.getElementById('mode-select').value;
+      const mode = PORTAL_SOLO_ONLY ? 'solo' : document.getElementById('mode-select').value;
       const vision = document.getElementById('vision-check').checked;
       const tag = document.getElementById('tag-select').value;
       const modeLabel = mode || m.default_mode || 'auto';
@@ -1116,8 +1150,8 @@ PORTAL_HTML = r"""<!doctype html>
         tag: tag,
         ctx: document.getElementById('ctx-input').value || '',
         parallel: document.getElementById('parallel-input').value || '',
-        split_mode: document.getElementById('split-mode-select').value || '',
-        tensor_split: document.getElementById('tensor-split-select').value || '',
+        split_mode: (!PORTAL_SOLO_ONLY && (mode || m.default_mode) === 'distributed') ? (document.getElementById('split-mode-select').value || '') : '',
+        tensor_split: (!PORTAL_SOLO_ONLY && (mode || m.default_mode) === 'distributed') ? (document.getElementById('tensor-split-select').value || '') : '',
         skip_clone: document.getElementById('skip-clone').checked,
         skip_build: document.getElementById('skip-build').checked,
         skip_download: document.getElementById('skip-download').checked,
@@ -1188,7 +1222,8 @@ PORTAL_HTML = r"""<!doctype html>
     }
 
     async function undeploy() {
-      if (!confirm('Stop llama-server and rpc-server?')) return;
+      const prompt = PORTAL_SOLO_ONLY ? 'Stop llama-server?' : 'Stop llama-server and rpc-server?';
+      if (!confirm(prompt)) return;
       document.getElementById('undeploy-btn').disabled = true;
       document.getElementById('undeploy-btn').textContent = 'Stopping...';
       try {
@@ -1342,7 +1377,7 @@ PORTAL_HTML = r"""<!doctype html>
       const latest = data.latest;
       const dgxBannerEl = document.getElementById('dgx-offline-banner');
       const dgxBannerTextEl = document.getElementById('dgx-offline-text');
-      const dgxOffline = latest.mode === 'DISTRIBUTED' && latest.rpc_server !== 'UP';
+      const dgxOffline = !PORTAL_SOLO_ONLY && latest.mode === 'DISTRIBUTED' && latest.rpc_server !== 'UP';
       const currentModelId = latest.serving_model || latest.backend_model || '';
       const currentModel = currentModelId
         ? modelsData.find(x => x.id === currentModelId || x.alias === currentModelId)
@@ -1371,7 +1406,8 @@ PORTAL_HTML = r"""<!doctype html>
         ["updated", latest.timestamp],
         ["llama", latest.llama_server],
         ["rpc", latest.rpc_server],
-      ].map(([k, v]) => `<div class="pill"><span class="dot ${stateClass(v)}"></span>${k}: ${v}</div>`).join("");
+      ].filter(([k]) => !PORTAL_SOLO_ONLY || k !== 'rpc')
+       .map(([k, v]) => `<div class="pill"><span class="dot ${stateClass(v)}"></span>${k}: ${v}</div>`).join("");
 
       if (dgxOffline) {
         dgxBannerEl.classList.add('visible');
@@ -1402,6 +1438,7 @@ PORTAL_HTML = r"""<!doctype html>
         `<tbody>${visibleRows.map(([label, key]) => `<tr><td>${label}</td>${history.map((h) => { const v = h.empty ? "--" : (h[key] == null ? "--" : h[key]); return `<td class="${h.empty || v === "--" ? "" : stateClass(v, key)}">${v}</td>`; }).join("")}</tr>`).join("")}</tbody>`;
 
       document.getElementById("endpoints").innerHTML = Object.entries(latest.endpoints)
+        .filter(([k, v]) => (!PORTAL_SOLO_ONLY || k !== 'rpc') && v !== '--')
         .map(([k, v]) => `<div class="endpoint-item"><div class="label">${k}</div><a href="${String(v).startsWith("http") ? v : "#"}" target="_blank">${v}</a></div>`)
         .join("");
 
@@ -1422,6 +1459,7 @@ PORTAL_HTML = r"""<!doctype html>
 
     // --- Init ---
     document.getElementById('deploy-btn').disabled = true;
+    applyPortalMode();
     loadModels();
     loadTags();
     checkDeployStatus();
@@ -1519,7 +1557,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # Portal
         if path in ("/", "/monitor"):
-            _html_response(self, PORTAL_HTML)
+            _html_response(self, PORTAL_HTML.replace("__PORTAL_SOLO_ONLY__", "true" if PORTAL_SOLO_ONLY else "false"))
             return
 
         # Monitor API (unchanged)
@@ -1561,6 +1599,15 @@ class Handler(BaseHTTPRequestHandler):
             if not params.get("model"):
                 _json_response(self, {"error": "model required"}, 400)
                 return
+            model_conf = get_model_conf(params["model"])
+            if not model_conf:
+                _json_response(self, {"error": "unknown model"}, 400)
+                return
+            if PORTAL_SOLO_ONLY:
+                if model_conf.get("solo") != "yes":
+                    _json_response(self, {"error": "model is not available in managed solo mode"}, 400)
+                    return
+                params["mode"] = "solo"
             deploy_id = str(uuid.uuid4())[:8]
             if not DEPLOY.start(params["model"], deploy_id, params):
                 _json_response(self, {"error": "deployment already in progress"}, 409)
@@ -1578,7 +1625,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/undeploy":
             stopped = []
             env = dict(os.environ, TERM="dumb", SKIP_MONITOR_RESTART="1")
-            for name, step in [("llama-server", "stop-llama"), ("rpc-server", "stop-rpc")]:
+            steps = [("llama-server", "stop-llama")]
+            if not PORTAL_SOLO_ONLY:
+                steps.append(("rpc-server", "stop-rpc"))
+            for name, step in steps:
                 try:
                     r = subprocess.run(
                         ["bash", DEPLOY_SCRIPT, "debug", step],
